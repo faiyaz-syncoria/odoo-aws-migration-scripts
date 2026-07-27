@@ -166,9 +166,34 @@ ${ADMIN_PSQL} -c "CREATE DATABASE \"${TARGET_DBNAME}\" OWNER \"${PG_ODOO_DB_USER
 # ensure unaccent/pg_trgm exist if the dump expects them
 ${ADMIN_PSQL} -d "${TARGET_DBNAME}" -c "CREATE EXTENSION IF NOT EXISTS unaccent;" >/dev/null 2>&1 || true
 ${ADMIN_PSQL} -d "${TARGET_DBNAME}" -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"  >/dev/null 2>&1 || true
+# pgvector: Odoo 19+'s 'ai' module needs the `vector` type for ai_embedding.embedding_vector.
+# odoo-bootstrap.sh installs this at deploy time, but re-assert here (idempotent, fast if
+# already present) so a restore onto a box deployed before this fix still gets it.
+if [[ -n "${PG_VERSION:-}" ]] && ! dpkg -s "postgresql-${PG_VERSION}-pgvector" >/dev/null 2>&1; then
+  log "Installing pgvector for PostgreSQL ${PG_VERSION} (not present from bootstrap)"
+  apt-get -o DPkg::Lock::Timeout=300 update -qq
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq "postgresql-${PG_VERSION}-pgvector" >/dev/null 2>&1 || \
+    log "WARN: could not install postgresql-${PG_VERSION}-pgvector - 'ai' module reconcile will fail"
+fi
+${ADMIN_PSQL} -d "${TARGET_DBNAME}" -c "CREATE EXTENSION IF NOT EXISTS vector;" >/dev/null 2>&1 || true
 
 log "Loading dump into ${TARGET_DBNAME}"
 ${PSQL} -d "${TARGET_DBNAME}" -v ON_ERROR_STOP=0 -q -f "${DUMP}"
+
+# Known odoo.sh data quirk: some source databases carry orphaned ai_agent_ai_topic_rel
+# rows referencing ai_topic ids that don't exist in ai_topic itself (ai_topic dumps
+# empty even though the relation table doesn't). This isn't caused by this restore -
+# the raw dump already contains the inconsistency - but it blocks `-u ai` later with
+# a foreign key violation, so clean it up here if present.
+if ${PSQL} -d "${TARGET_DBNAME}" -tAc "SELECT to_regclass('public.ai_agent_ai_topic_rel')" 2>/dev/null | grep -q ai_agent_ai_topic_rel; then
+  orphans="$(${PSQL} -d "${TARGET_DBNAME}" -tAc \
+    "SELECT count(*) FROM ai_agent_ai_topic_rel WHERE ai_topic_id NOT IN (SELECT id FROM ai_topic)" 2>/dev/null || echo 0)"
+  if [[ "${orphans:-0}" -gt 0 ]]; then
+    log "Cleaning ${orphans} orphaned ai_agent_ai_topic_rel row(s) (ai_topic data missing from source dump)"
+    ${PSQL} -d "${TARGET_DBNAME}" -c \
+      "DELETE FROM ai_agent_ai_topic_rel WHERE ai_topic_id NOT IN (SELECT id FROM ai_topic);" >/dev/null 2>&1 || true
+  fi
+fi
 
 # Downgrade guard: a DB from a newer Odoo cannot run on an older codebase.
 if [[ -n "${TARGET_ODOO_VERSION:-}" ]]; then

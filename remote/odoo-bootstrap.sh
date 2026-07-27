@@ -104,6 +104,15 @@ https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
 fi
 systemctl enable --now postgresql
 
+# pgvector: required by Odoo 19+'s built-in 'ai' module (ai_embedding.embedding_vector
+# is a `vector(1536)` column). Same PGDG repo as postgresql-${PG_VERSION} above, so no
+# extra repo setup needed. Without this, any `-u ai` (or full registry load touching
+# the ai module) fails with "type \"vector\" does not exist".
+if ! dpkg -s "postgresql-${PG_VERSION}-pgvector" >/dev/null 2>&1; then
+  log "Installing pgvector for PostgreSQL ${PG_VERSION}"
+  apt-get -o DPkg::Lock::Timeout=300 install -y -qq "postgresql-${PG_VERSION}-pgvector" >/dev/null
+fi
+
 log "Ensuring PostgreSQL role '${PG_ODOO_DB_USER}'"
 sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${PG_ODOO_DB_USER}'" | grep -q 1 || \
   sudo -u postgres psql -c "CREATE ROLE ${PG_ODOO_DB_USER} LOGIN CREATEDB PASSWORD '${PG_ODOO_DB_PASSWORD}';"
