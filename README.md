@@ -102,8 +102,16 @@ gate between each.
 | Script | Purpose |
 |--------|---------|
 | `configure.sh` | Interactive setup — the entry point for a new project. Choose instance specs and everything else; writes `config.env`. |
+| `99-teardown.sh` | Destroy all AWS resources for the project (instances, EIPs, data volumes, SG, subnet, IGW, VPC, key pair) + clear local state. Requires typed confirmation. Irreversible; odoo.sh untouched. |
 | `update-my-ip.sh` | Lock SSH (22) to your current public IP. Re-run when you change networks. NAT-safe: never revokes a manually-added broader rule. |
 | `restrict-web-to-cloudflare.sh` | Lock origin 80/443 to Cloudflare's IP ranges (when proxied). `--open` reverts. |
+
+### Driving it with Claude Code
+
+`CLAUDE.md` is auto-loaded project context + safety rules for Claude Code, and
+`PROMPTS.md` is a copy-paste prompt library for every operation (fresh migration,
+re-migration with teardown, config setup, per-step ops, cutover, maintenance).
+Run `claude` from this repo and start with the "Start any session" prompt.
 
 ```
 odoo-aws-migration/
@@ -115,8 +123,11 @@ odoo-aws-migration/
 ├── 03-migrate-from-odoosh.sh
 ├── 04-harden-and-tune.sh
 ├── run-all.sh                # orchestrator
+├── 99-teardown.sh            # destroy all AWS resources (for a clean re-run)
 ├── update-my-ip.sh
 ├── restrict-web-to-cloudflare.sh
+├── CLAUDE.md                 # project context + rules for Claude Code
+├── PROMPTS.md                # prompt library for Claude Code operations
 ├── CUTOVER.md                # go-live runbook
 ├── lib/common.sh             # shared helpers (logging, state, ssh, aws lookups)
 └── remote/                   # scripts executed ON the EC2 boxes
