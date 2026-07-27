@@ -7,6 +7,8 @@ destructive actions, pause after each checkpoint, never print secrets).
 
 Replace `<...>` placeholders before sending. Prompts are ordered from
 setup → fresh migration → re-migration → per-step ops → cutover → maintenance.
+This library is refined from real migration sessions — see the Tips at the
+bottom for gotchas that keep coming up in practice.
 
 ---
 
@@ -14,8 +16,9 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 
 > Read `CLAUDE.md`, `README.md`, and `CUTOVER.md` in this repo so you have full
 > context on this Odoo.sh→AWS migration toolkit. Summarize back to me the current
-> state (does `config.env` exist? what does `.state/` show is provisioned?) and
-> wait for my instruction. Do not run anything destructive without confirming.
+> state (does `config.env` exist? what does `.state/` show is provisioned? what's
+> in `secrets/`?) and wait for my instruction. Do not run anything destructive
+> without confirming.
 
 ---
 
@@ -26,7 +29,9 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > Run `./configure.sh` and walk me through it. I want to choose instance specs
 > for both environments, region, Odoo version, backup source, and TLS mode.
 > After it writes `config.env`, run `./00-preflight.sh` and help me fix anything
-> it flags before we go further. Don't print my GitHub token or any secrets.
+> it flags before we go further — including any branch-not-found warnings under
+> "GitHub access" (don't skip past those, they mean the module code Claude will
+> deploy won't match what you expect). Don't print my GitHub token or any secrets.
 
 **Guided edit (config.env already exists, tweak a few values):**
 
@@ -34,6 +39,15 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > I want to change: <e.g. PRODUCTION_INSTANCE_TYPE to m5.large, ODOO_VERSION to
 > 18.0>. Update those keys in `config.env`, keep everything else, then run
 > `./00-preflight.sh` and report the result.
+
+**Low-spec demo/test profile (cheap, throwaway environment):**
+
+> This is a demo/test instance, not a real production workload. Set both
+> `PRODUCTION_INSTANCE_TYPE` and `STAGING_INSTANCE_TYPE` to `t3.small` and both
+> EBS sizes to `<e.g. 10-20>` GB, keep everything else in `config.env` unchanged,
+> then run `./00-preflight.sh`. Flag if `t3.small`'s 2GB RAM looks too tight for
+> what I'm actually planning to do with it (real data volume, several concurrent
+> users, etc.) before we provision.
 
 ---
 
@@ -44,12 +58,18 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > \<path\> / Cloudflare origin cert at secrets/cf-origin.pem+key>. Do this,
 > pausing for my confirmation between each checkpoint:
 > 1. `aws sts get-caller-identity` (tell me if I need to re-auth).
-> 2. `./configure.sh` (or confirm config.env is complete) then `./00-preflight.sh`.
-> 3. `./01-provision-aws.sh` — then STOP and give me the new Elastic IPs so I can
->    create/point the Cloudflare A records (proxied) before continuing.
+> 2. `./configure.sh` (or confirm config.env is complete) then `./00-preflight.sh`
+>    — resolve any warnings (especially branch-not-found) before continuing.
+> 3. `./01-provision-aws.sh` — then check whether the domains already resolve
+>    somewhere (`dig +short <domain>`) before assuming DNS needs pointing fresh;
+>    either way, STOP and give me the new Elastic IPs so I can confirm/create the
+>    Cloudflare A records (proxied) before continuing.
 > 4. `./02-deploy-odoo.sh`.
 > 5. `./03-migrate-from-odoosh.sh production` then `... staging`, verifying each
->    DB loads cleanly (registry loaded, web 200, no UndefinedColumn).
+>    DB loads cleanly (registry loaded, web 200, no UndefinedColumn/Traceback in
+>    the log). If a custom module fails its schema reconcile, diagnose whether
+>    it's an infra issue (missing extension/package) or a genuine bug in that
+>    module's code before treating it as blocking.
 > 6. `./04-harden-and-tune.sh` then `./restrict-web-to-cloudflare.sh`.
 > Report a short status after each step. Never print secrets.
 
@@ -65,9 +85,14 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > 1. `aws sts get-caller-identity` (re-auth if needed), then `./99-teardown.sh`.
 > 2. Verify nothing lingers (describe-instances / describe-vpcs by Project tag).
 > 3. `rm -f secrets/<PROJECT_NAME>-key.pem` (AWS key is gone; drop the stale local one).
-> 4. Then run the fresh migration exactly as in prompt #2, pausing between
+> 4. If this re-run should use different specs (e.g. downsizing to a demo
+>    profile), update `config.env` first — see prompt #1's "low-spec demo/test
+>    profile" — and confirm whether `secrets/*-db-password`,
+>    `*-master-password`, and any TLS cert/key should be kept as-is (same
+>    subdomains) or regenerated.
+> 5. Then run the fresh migration exactly as in prompt #2, pausing between
 >    checkpoints, and remind me to re-point Cloudflare DNS to the NEW Elastic IPs
->    after provisioning.
+>    after provisioning (check with `dig` first — it may already be correct).
 
 ---
 
@@ -75,29 +100,59 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 
 **Provision only:**
 > `aws sts get-caller-identity`, then `./01-provision-aws.sh`. Report the Elastic
-> IPs and instance IDs, and remind me to point DNS at them.
+> IPs and instance IDs, and remind me to point DNS at them (check with `dig`
+> first in case it's already correct).
 
 **Deploy Odoo only (one or both envs):**
-> Run `./02-deploy-odoo.sh <production|staging|both>` and confirm each box ends
-> with "Odoo is responding". If it fails, read the box's `/tmp/bootstrap.log` and
-> tell me the cause before retrying.
+> Run `./02-deploy-odoo.sh <production|staging>` (no args = both) and confirm
+> each box ends with "Odoo is responding". If it fails, read the box's
+> `/tmp/bootstrap.log` and tell me the cause before retrying.
 
 **Migrate one environment:**
 > Run `./03-migrate-from-odoosh.sh <env>`. After it finishes, verify the DB loads
 > cleanly (ssh to the box, check web 200 and `/var/log/odoo/odoo.log` for
-> `Registry loaded` and no `UndefinedColumn`). If a column is missing, run the
-> targeted `-u <module>` reconcile and re-check.
+> `Registry loaded` and no `Traceback`/`UndefinedColumn`). If a module's schema
+> reconcile failed, use the "Diagnose a failed module reconcile" prompt below
+> rather than assuming it's safe to ignore.
 
 **Seed staging from the production backup (no separate staging backup):**
 > Set `ODOOSH_STAGING_DUMP_FILE` to the production backup zip and
-> `ODOOSH_STAGING_BRANCH=main` in `config.env`, then run
-> `./03-migrate-from-odoosh.sh staging`. Confirm it neutralizes staging
-> (mail/crons/payments off).
+> `ODOOSH_STAGING_BRANCH` to the correct branch name (verify it actually exists
+> in the repo first — branch names on odoo.sh don't always match what's in
+> `config.env`) in `config.env`, then run `./03-migrate-from-odoosh.sh staging`.
+> Confirm it neutralizes staging (mail/crons/payments off).
 
 **Harden / TLS only:**
 > Run `./04-harden-and-tune.sh <env>`. Confirm nginx config test passes and HTTPS
 > is live. Then run `./restrict-web-to-cloudflare.sh`. If certbot/origin cert
 > errors, read `/tmp/harden.log` and diagnose.
+
+**Create or reset an Odoo admin user:**
+> On <env>, create (or reset the password for) an Odoo backend user with login
+> `<email>` and full admin rights. Generate a strong random password with no
+> special characters (to avoid copy/paste issues), do this via `odoo-bin shell`
+> against the target database rather than raw SQL (note: the groups field on
+> `res.users` may be named `group_ids` rather than `groups_id` depending on
+> Odoo version — check first). Store the password in
+> `secrets/<env>-admin-user-password` (chmod 600), verify the login actually
+> works end-to-end via the `/web/session/authenticate` endpoint, and tell me
+> only the file path — don't print the password itself, and don't include it in
+> any chat message, email, or other message you send on my behalf unless I
+> explicitly ask for that specific exception.
+
+**Diagnose a failed module reconcile (schema issues after migration):**
+> `-u <module>` failed on <env> during migration/reconcile. SSH in and check
+> `/var/log/odoo/odoo.log` for the actual traceback (not just the one-line WARN
+> in the restore log). Distinguish between: (a) an infra/dependency issue (e.g.
+> a missing PostgreSQL extension or package — fixable at the toolkit level, flag
+> it as a follow-up task so future migrations don't hit it), (b) leftover
+> inconsistent data from the source odoo.sh dump (e.g. orphaned rows violating a
+> foreign key that didn't exist before) — check whether cleaning it up is safe
+> and scoped, and confirm with me before deleting any rows, (c) a genuine bug in
+> that module's own code (e.g. a broken external ID / view reference) — don't
+> try to "fix" this at the infra level; report it clearly as a code issue for
+> the module's developer. Restart Odoo and confirm the app itself is still
+> healthy regardless of which category it turns out to be.
 
 ---
 
@@ -105,8 +160,12 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 
 **Refresh SSH access after changing networks:**
 > Run `./update-my-ip.sh`, then verify SSH works: `nc -vz -w5 <prod-eip> 22`. If
-> it times out on a NAT'd network, add a broader `/24` rule for my egress range
-> (don't remove the Cloudflare web rules) and tell me what you added.
+> it still times out, sample `curl -fsS https://checkip.amazonaws.com` a few
+> times in a row — if the IP is different every time, this is a carrier/NAT pool
+> rotating faster than a single `/32` rule can track, not a fluke. In that case,
+> tell me the pool's `/24` before adding it as a security-group rule (don't
+> remove the Cloudflare web rules), since it's a broader access grant than a
+> single IP and I want to confirm it first.
 
 **Lock / unlock origin to Cloudflare:**
 > Lock: `./restrict-web-to-cloudflare.sh`. Unlock (for direct testing):
@@ -122,6 +181,9 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > the delta; verify a clean registry load; re-enable prod side effects
 > (`ir_cron`, `ir_mail_server`) and remind me to re-verify payment providers in
 > the Odoo UI deliberately; then I cut DNS. Do NOT enable payments in bulk.
+> Once live, confirm whether the admin user(s) created during testing should
+> stay, be disabled, or have their passwords rotated before go-live traffic
+> starts.
 
 ---
 
@@ -143,6 +205,14 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 > On <env>, run `/usr/local/bin/odoo-backup.sh` manually, then list
 > `/opt/odoo/backups` and confirm a fresh dump + filestore archive exist.
 
+**Safely retrieve or share a credential:**
+> I need <the production DB password / master password / admin login> for
+> <reason>. Don't print the raw value in chat, and don't email or message it
+> anywhere on my behalf by default — either tell me the exact file path in
+> `secrets/` to check myself, or give me a one-line command I can run locally
+> that prints it in my own terminal. Only include the actual value directly in
+> your response if I explicitly say so after you've flagged the risk.
+
 **Diagnose a failed step (generic):**
 > The last run of `<script>` failed. Read the relevant log on the box
 > (`/tmp/{bootstrap,restore,reconcile,harden}.log` or `/var/log/odoo/odoo.log`),
@@ -160,12 +230,36 @@ setup → fresh migration → re-migration → per-step ops → cutover → main
 
 ---
 
+## 9. Commit & push toolkit changes
+
+> Show me `git status` and `git diff` for the changes made this session. Draft a
+> commit message that explains *why* the change was made (not just what
+> changed), commit only the relevant files (not a blanket `git add -A`), and
+> confirm with me before pushing to `origin/main` if there are any commits ahead
+> of origin that predate this session — I want to know what's being pushed
+> together, not just what I asked for this session.
+
+---
+
 ### Tips
 
 - Claude Code prompts before running commands — approve destructive ones
   deliberately. You can pre-approve safe read-only commands in its settings.
 - Keep your AWS session fresh; if a step says "not authenticated", run
-  `aws sso login` (or paste fresh credentials) and retry.
+  `aws sso login` (or paste fresh credentials) and retry — sessions can expire
+  mid-session even if a check passed a few minutes earlier.
+- If SSH suddenly stops working partway through a session, don't assume the box
+  is unhealthy — check your own public IP first (`curl checkip.amazonaws.com`).
+  Carrier/guest-NAT networks can rotate it even faster than `update-my-ip.sh`
+  can keep up with a single `/32` rule.
+- Never ask Claude Code to paste raw secrets (passwords, tokens, private keys)
+  into a chat message, email, or any other message sent on your behalf — it
+  will (and should) push back and offer a local-only alternative instead. This
+  is by design, not a bug to work around.
 - After changing any script, re-copy to this repo isn't needed if you're already
   editing here — just commit. If editing elsewhere, keep this repo the source of
   truth.
+- Odoo's `res.users` group field has been renamed across versions (`groups_id`
+  → `group_ids` as of Odoo 19) — if a scripted user/group change fails with
+  "Invalid field", check the field name for the version actually deployed
+  rather than assuming the script is wrong.
