@@ -14,6 +14,8 @@ step is idempotent and fails loudly with a clear message.
 ## TL;DR — running it for a new project
 
 ```bash
+aws configure                 # 0. authenticate the AWS CLI (once per machine)
+aws sts get-caller-identity   #    confirm the session is live
 ./configure.sh        # 1. interactively choose region, per-env instance specs,
                       #    Odoo version, backup source, TLS mode, domains, creds
 ./00-preflight.sh     # 2. validate EVERY prerequisite (fix anything it flags)
@@ -44,6 +46,43 @@ then `./run-all.sh production`.
   guest/carrier networks block it — preflight warns).
 
 ---
+
+## AWS authentication (do this first)
+
+The scripts never handle AWS credentials themselves — they rely on the AWS CLI
+being authenticated in your shell. Two commands matter:
+
+- **`aws configure`** — one-time setup of your credentials and default region.
+  Run it before anything else so the CLI knows who you are and where to build.
+  Enter your Access Key, Secret Key, default region (must match `AWS_REGION`,
+  e.g. `us-east-2`), and output format (`json`). If your org uses AWS SSO / IAM
+  Identity Center instead of static keys, run `aws configure sso` once, then
+  `aws sso login` to start each session, and set `AWS_PROFILE` in `config.env`
+  to that profile name.
+
+  ```bash
+  aws configure          # static keys
+  # or, for SSO:
+  aws configure sso      # one-time
+  aws sso login          # each session
+  ```
+
+- **`aws sts get-caller-identity`** — verifies you're actually authenticated and
+  shows which account/role you're acting as. Always run it before a migration
+  step (and any time a step reports an auth error) to confirm your session is
+  live — SSO/temporary sessions expire (often hourly) and must be refreshed.
+  A successful call prints your `Account` and `Arn`:
+
+  ```bash
+  aws sts get-caller-identity
+  # {"UserId": "...", "Account": "123456789012", "Arn": "arn:aws:sts::..."}
+  ```
+
+Why it matters here: **checkpoint 1** (provisioning) and the security-group
+helpers (`update-my-ip.sh`, `restrict-web-to-cloudflare.sh`) call the AWS API and
+will fail immediately if the session is missing or expired. Checkpoints 2–4 work
+over SSH and are unaffected by an expired AWS session, but `00-preflight.sh`
+checks `get-caller-identity` up front so you catch it before you start.
 
 ## The four checkpoints
 
