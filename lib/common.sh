@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+# =============================================================================
+# lib/common.sh  -  shared helpers sourced by every migration script.
+# Provides: strict mode, logging, config loading, secret handling, idempotency
+# helpers, AWS lookup helpers, and remote-exec helpers.
+# =============================================================================
+
+# ---- strict mode ------------------------------------------------------------
+set -Eeuo pipefail
+IFS=$'\n\t'
+
+# ---- resolve repo root (dir that contains config.env) -----------------------
+# Works regardless of the directory the caller invokes from.
+COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${COMMON_DIR}/.." && pwd)"
+SECRETS_DIR="${REPO_ROOT}/secrets"
+STATE_DIR="${REPO_ROOT}/.state"
+LOG_DIR="${REPO_ROOT}/logs"
+mkdir -p "${SECRETS_DIR}" "${STATE_DIR}" "${LOG_DIR}"
+chmod 700 "${SECRETS_DIR}"
+
+# ---- colours / logging ------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GRN=$'\033[32m'
+  C_YEL=$'\033[33m'; C_BLU=$'\033[34m'; C_BOLD=$'\033[1m'
+else
+  C_RESET=""; C_RED=""; C_GRN=""; C_YEL=""; C_BLU=""; C_BOLD=""
+fi
+
+_ts() { date +'%Y-%m-%d %H:%M:%S'; }
+log()   { echo "${C_BLU}[$(_ts)]${C_RESET} $*"; }
+info()  { echo "${C_BLU}[$(_ts)] INFO ${C_RESET} $*"; }
+ok()    { echo "${C_GRN}[$(_ts)] OK   ${C_RESET} $*"; }
+warn()  { echo "${C_YEL}[$(_ts)] WARN ${C_RESET} $*" >&2; }
+err()   { echo "${C_RED}[$(_ts)] ERROR${C_RESET} $*" >&2; }
+die()   { err "$*"; exit 1; }
+
+# banner for a major checkpoint
+checkpoint() {
+  echo
+  echo "${C_BOLD}${C_GRN}==============================================================${C_RESET}"
+  echo "${C_BOLD}${C_GRN}  CHECKPOINT: $*${C_RESET}"
+  echo "${C_BOLD}${C_GRN}==============================================================${C_RESET}"
+  echo
+}
+
+# error trap - shows the failing line for fast diagnosis
+_on_err() {
+  local ec=$?
+  err "Failed (exit ${ec}) at ${BASH_SOURCE[1]:-?}:${BASH_LINENO[0]:-?} : ${BASH_COMMAND}"
+  exit "${ec}"
+}
+trap _on_err ERR
+
+# ---- config loading ---------------------------------------------------------
+load_config() {
+  local cfg="${REPO_ROOT}/config.env"
+  [[ -f "${cfg}" ]] || die "config.env not found. Run: cp config.env.example config.env  and edit it."
+  # shellcheck disable=SC1090
+  source "${cfg}"
+  : "${PROJECT_NAME:?PROJECT_NAME missing in config.env}"
+  : "${AWS_REGION:?AWS_REGION missing in config.env}"
+  export AWS_DEFAULT_REGION="${AWS_REGION}"
+  if [[ -n "${AWS_PROFILE:-}" ]]; then export AWS_PROFILE; fi
+  return 0
+}
+
+# fail loudly if any <CHANGE_ME...> placeholders remain in the vars we need
+require_no_placeholder() {
+  local name val
+  for name in "$@"; do
+    val="${!name:-}"
+    if [[ -z "${val}" ]]; then die "Config ${name} is empty."; fi
+    if [[ "${val}" == *CHANGE_ME* ]]; then die "Config ${name} still holds a placeholder: ${val}"; fi
+  done
+  return 0
+}
+
+# ---- secrets ----------------------------------------------------------------
+# gen_secret <length>  -> url-safe random string
+gen_secret() { openssl rand -base64 "${1:-24}" | tr -d '/+=' | cut -c1-"${1:-24}"; }
+
+# resolve_secret VARNAME FILE  : if $VARNAME == AUTO, generate, persist to FILE.
+# echoes the resolved value.
+resolve_secret() {
+  local varname="$1" file="${SECRETS_DIR}/$2"
+  local val="${!varname:-}"
+  if [[ "${val}" == "AUTO" ]]; then
+    if [[ -f "${file}" ]]; then val="$(cat "${file}")"; else
+      val="$(gen_secret 30)"; umask 077; printf '%s' "${val}" > "${file}"
+    fi
+  fi
+  printf '%s' "${val}"
+}
+
+# ---- idempotency state ------------------------------------------------------
+# Values discovered during provisioning (VPC id, instance ids, IPs...) are
+# written to .state/<env>.env so later scripts can consume them.
+state_file() { echo "${STATE_DIR}/${1}.env"; }
+
+state_set() { # env key value
+  local f; f="$(state_file "$1")"; touch "${f}"
+  grep -v "^${2}=" "${f}" > "${f}.tmp" 2>/dev/null || true
+  echo "${2}=${3}" >> "${f}.tmp"; mv "${f}.tmp" "${f}"
+}
+state_get() { # env key
+  local f; f="$(state_file "$1")"
+  [[ -f "${f}" ]] && (grep "^${2}=" "${f}" | tail -1 | cut -d= -f2-) || true
+}
+state_load() { # env  -> sources all keys into environment
+  local f; f="$(state_file "$1")"; [[ -f "${f}" ]] && source "${f}" || true
+}
+
+# ---- prerequisite checks ----------------------------------------------------
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"; }
+
+check_aws_auth() {
+  need_cmd aws
+  aws sts get-caller-identity >/dev/null 2>&1 \
+    || die "AWS CLI is not authenticated for profile '${AWS_PROFILE:-default}'. Run 'aws configure'."
+}
+
+# ---- per-environment spec resolver -----------------------------------------
+# Sets ENV_* variables for the given environment name.
+resolve_env_spec() {
+  local e="$1" up
+  up="$(echo "${e}" | tr '[:lower:]' '[:upper:]')"
+  ENV_NAME="${e}"
+  ENV_INSTANCE_TYPE="$(eval echo "\${${up}_INSTANCE_TYPE}")"
+  ENV_EBS_GB="$(eval echo "\${${up}_EBS_GB}")"
+  ENV_MONITORING="$(eval echo "\${${up}_MONITORING}")"
+  ENV_TENANCY="$(eval echo "\${${up}_TENANCY}")"
+  ENV_DOMAIN="$(eval echo "\${${up}_DOMAIN}")"
+  export ENV_NAME ENV_INSTANCE_TYPE ENV_EBS_GB ENV_MONITORING ENV_TENANCY ENV_DOMAIN
+}
+
+# ---- AWS lookup helpers (idempotency by Name tag) ---------------------------
+tag_name() { echo "${PROJECT_NAME}-$1"; }   # e.g. tag_name production -> syncoria-odoo-production
+
+aws_vpc_id() {
+  aws ec2 describe-vpcs \
+    --filters "Name=tag:Name,Values=$(tag_name vpc)" "Name=state,Values=available" \
+    --query 'Vpcs[0].VpcId' --output text 2>/dev/null | grep -v '^None$' || true
+}
+aws_instance_id() { # env
+  aws ec2 describe-instances \
+    --filters "Name=tag:Name,Values=$(tag_name "$1")" \
+              "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text 2>/dev/null \
+    | grep -v '^None$' || true
+}
+aws_instance_public_ip() { # instance-id
+  aws ec2 describe-instances --instance-ids "$1" \
+    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text 2>/dev/null \
+    | grep -v '^None$' || true
+}
+
+# ---- remote exec helpers ----------------------------------------------------
+# Run a local script on a remote box over SSH.
+ssh_key_path() { echo "${SECRETS_DIR}/${EC2_KEY_NAME}.pem"; }
+
+remote_ssh() { # host  command...
+  local host="$1"; shift
+  ssh -i "$(ssh_key_path)" -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=15 "${SSH_USER}@${host}" "$@"
+}
+remote_copy() { # src  host:dest
+  local src="$1" dest="$2"
+  scp -i "$(ssh_key_path)" -o StrictHostKeyChecking=accept-new -q "${src}" "${SSH_USER}@${dest}"
+}
+# Copy a script up and run it with sudo, streaming output back.
+remote_run_script() { # host  local_script  [args...]
+  local host="$1" script="$2"; shift 2
+  local base; base="$(basename "${script}")"
+  remote_copy "${script}" "${host}:/tmp/${base}"
+  remote_ssh "${host}" "chmod +x /tmp/${base} && sudo /tmp/${base} $*"
+}
+
+# wait until SSH is answering on a host
+wait_for_ssh() { # host
+  local host="$1" tries=40
+  info "Waiting for SSH on ${host} ..."
+  until remote_ssh "${host}" true 2>/dev/null; do
+    ((tries--)) || die "SSH never came up on ${host}"
+    sleep 10
+  done
+  ok "SSH is up on ${host}"
+}
+
+# confirm() prompt   -> returns 0 if user types yes (skipped when ASSUME_YES=1)
+confirm() {
+  [[ "${ASSUME_YES:-0}" == "1" ]] && return 0
+  read -r -p "$1 [y/N] " ans
+  [[ "${ans}" =~ ^([yY]|yes)$ ]]
+}

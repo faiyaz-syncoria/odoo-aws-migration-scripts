@@ -1,0 +1,8 @@
+# secrets and generated state - never commit
+config.env
+secrets/
+.state/
+logs/
+*.pem
+*.key
+err.txt
