@@ -6,7 +6,8 @@ directory). Each assumes Claude Code will read `CLAUDE.md`, `README.md`, and
 destructive actions, pause after each checkpoint, never print secrets).
 
 Replace `<...>` placeholders before sending. Prompts are ordered from
-setup → fresh migration → re-migration → per-step ops → cutover → maintenance.
+setup → fresh migration → re-migration → per-step ops → CI/CD → cutover →
+maintenance.
 This library is refined from real migration sessions — see the Tips at the
 bottom for gotchas that keep coming up in practice.
 
@@ -71,6 +72,8 @@ bottom for gotchas that keep coming up in practice.
 >    it's an infra issue (missing extension/package) or a genuine bug in that
 >    module's code before treating it as blocking.
 > 6. `./04-harden-and-tune.sh` then `./restrict-web-to-cloudflare.sh`.
+> 7. If auto-deploy on merge is wanted, run `./setup-ci-deploy.sh` (see prompt
+>    #6) — do this last, since it needs `02-deploy-odoo.sh` already done.
 > Report a short status after each step. Never print secrets.
 
 ---
@@ -121,6 +124,13 @@ bottom for gotchas that keep coming up in practice.
 > in the repo first — branch names on odoo.sh don't always match what's in
 > `config.env`) in `config.env`, then run `./03-migrate-from-odoosh.sh staging`.
 > Confirm it neutralizes staging (mail/crons/payments off).
+
+**Deploy latest code without touching data (one or both envs):**
+> Run `./05-update-addons.sh <env>` (no args = both). This is NOT the same as
+> `./03-migrate-from-odoosh.sh` — it pulls the latest custom addon code and
+> reconciles schema against the *existing* database, no drop/recreate. Confirm
+> the admin user and a couple of real record counts (e.g. `res_partner`,
+> `sale_order`) are unchanged before and after, to prove no data was touched.
 
 **Harden / TLS only:**
 > Run `./04-harden-and-tune.sh <env>`. Confirm nginx config test passes and HTTPS
@@ -173,7 +183,45 @@ bottom for gotchas that keep coming up in practice.
 
 ---
 
-## 6. Cutover to production (go-live)
+## 6. Continuous deployment (auto-deploy on merge)
+
+**Set up CI/CD for the first time:**
+> Run `./setup-ci-deploy.sh` for both environments. This generates a
+> restricted SSH key (`secrets/ci-deploy-key`) and installs it on each box with
+> a forced `command=` restriction so it can only ever run the non-destructive
+> `05-update-addons.sh` deploy — verify this by trying an unrelated command
+> over SSH with that key (e.g. `whoami`) and confirming only the deploy runs,
+> nothing else. Then draft/apply `ci-templates/deploy.yml` to the odoo.sh addon
+> repo (ask me first how to deliver it — direct push, a PR, or hand it to me —
+> since that's a different repo than this one), and tell me the exact
+> `gh secret set` / `gh variable set` commands to run for `CI_DEPLOY_SSH_KEY`,
+> `PRODUCTION_HOST`, and `STAGING_HOST` (current Elastic IPs). Never print the
+> key's contents.
+
+**After a re-provision (Elastic IPs changed):**
+> The AWS environment was just re-provisioned and the Elastic IPs changed.
+> Re-run `./setup-ci-deploy.sh` (after `02-deploy-odoo.sh` has completed on the
+> new boxes — it needs `ODOO_HOME`/etc. to already exist) to reinstall the
+> forced-command entry; the CI keypair itself (`secrets/ci-deploy-key`) doesn't
+> need regenerating, only its server-side installation, since a fresh instance
+> boots with an empty `authorized_keys`. Then update the `PRODUCTION_HOST`/
+> `STAGING_HOST` repo variables on the addon repo to the new IPs
+> (`gh variable set ...`) — the `CI_DEPLOY_SSH_KEY` secret itself doesn't
+> change. Re-running `setup-ci-deploy.sh` also refreshes the persisted
+> repo/branch/token config on each box, so do the same after changing
+> `ODOOSH_REPO_URL`, a branch name, or rotating `GITHUB_TOKEN`, even without a
+> re-provision.
+
+**Diagnose a failed CI deploy:**
+> The GitHub Actions deploy failed for `<env>`. SSH in with the admin key (not
+> the CI key) and check `/tmp/update.log` and `/var/log/odoo/odoo.log` for the
+> actual error — likely the same categories as a migration reconcile failure
+> (infra/dependency, source data inconsistency, or a genuine module bug). Fix
+> at the right layer and confirm the app is healthy before re-triggering.
+
+---
+
+## 7. Cutover to production (go-live)
 
 > We're going live per `CUTOVER.md`. Walk me through it, confirming each step:
 > freeze odoo.sh; I'll download a fresh production backup; then
@@ -187,7 +235,7 @@ bottom for gotchas that keep coming up in practice.
 
 ---
 
-## 7. Maintenance / frequent tasks
+## 8. Maintenance / frequent tasks
 
 **Health check both environments:**
 > For production and staging, ssh in and report: Odoo service status, web
@@ -221,7 +269,7 @@ bottom for gotchas that keep coming up in practice.
 
 ---
 
-## 8. Teardown only (decommission)
+## 9. Teardown only (decommission)
 
 > Show me exactly what `./99-teardown.sh` will delete for project
 > `<PROJECT_NAME>` and wait for my explicit confirmation. This is irreversible.
@@ -230,7 +278,7 @@ bottom for gotchas that keep coming up in practice.
 
 ---
 
-## 9. Commit & push toolkit changes
+## 10. Commit & push toolkit changes
 
 > Show me `git status` and `git diff` for the changes made this session. Draft a
 > commit message that explains *why* the change was made (not just what
@@ -263,3 +311,7 @@ bottom for gotchas that keep coming up in practice.
   → `group_ids` as of Odoo 19) — if a scripted user/group change fails with
   "Invalid field", check the field name for the version actually deployed
   rather than assuming the script is wrong.
+- Any change to `~/.ssh/authorized_keys` must be append-only (check if a line
+  is already present, append if not) — never filter/rewrite the file. A remove
+  step is one bad match away from wiping every key and locking out SSH
+  entirely, which then requires EBS root-volume surgery to recover.

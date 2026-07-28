@@ -1,0 +1,84 @@
+# =============================================================================
+# GitHub Actions workflow TEMPLATE - for the odoo.sh addon repo
+# (syncoria/syncoria-Demo-Master), NOT this toolkit repo.
+#
+# Place this at .github/workflows/deploy.yml in that repo. Triggers a
+# non-destructive code deploy (pull latest addons + Python deps + schema
+# reconcile, no DB drop/recreate) on every push to main (production) or
+# Staging (staging), via the restricted CI deploy key set up by
+# ./setup-ci-deploy.sh in the odoo-aws-migration-scripts toolkit.
+#
+# One-time setup before this workflow can run:
+#   1. In odoo-aws-migration-scripts: ./setup-ci-deploy.sh
+#      (installs the forced-command SSH restriction on both boxes)
+#   2. In THIS repo (syncoria/syncoria-Demo-Master), set:
+#      - Secret   CI_DEPLOY_SSH_KEY  = contents of secrets/ci-deploy-key
+#      - Variable PRODUCTION_HOST    = current production Elastic IP
+#      - Variable STAGING_HOST       = current staging Elastic IP
+#      Example (run from the toolkit repo, never prints the key):
+#        gh secret set CI_DEPLOY_SSH_KEY --repo syncoria/syncoria-Demo-Master < secrets/ci-deploy-key
+#        gh variable set PRODUCTION_HOST --repo syncoria/syncoria-Demo-Master --body "<production EIP>"
+#        gh variable set STAGING_HOST    --repo syncoria/syncoria-Demo-Master --body "<staging EIP>"
+#
+# IMPORTANT: Elastic IPs change if the environment is ever torn down and
+# re-provisioned (./99-teardown.sh + ./01-provision-aws.sh). Update the
+# PRODUCTION_HOST / STAGING_HOST repo variables after any re-provision, or
+# this workflow will fail to connect. Also re-run ./setup-ci-deploy.sh on the
+# new boxes - the keypair itself doesn't change, but its server-side
+# installation does (a fresh instance has an empty authorized_keys).
+#
+# IMPORTANT: GitHub only fires a push-triggered workflow if the workflow file
+# already exists on the branch being pushed to. Adding this to `main` does NOT
+# cover `Staging` (or vice versa) - commit it to both branches separately if
+# you want both to auto-deploy (that's why this toolkit's setup opened two
+# companion PRs, one per branch, rather than one PR touching both).
+#
+# The SSH command below sends a literal "deploy" string, but the actual
+# command that runs is entirely determined server-side by the forced
+# `command=` restriction on the CI key (see setup-ci-deploy.sh) - whatever
+# is sent here is ignored. That's the point: even if this workflow file or
+# the secret were compromised, the attacker still can't run arbitrary
+# commands on the box, only this one non-destructive deploy script.
+# =============================================================================
+name: Deploy to AWS (Odoo)
+
+on:
+  push:
+    branches:
+      - main
+      - Staging
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve target host for this branch
+        id: target
+        run: |
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "host=${{ vars.PRODUCTION_HOST }}" >> "$GITHUB_OUTPUT"
+            echo "env_name=production" >> "$GITHUB_OUTPUT"
+          else
+            echo "host=${{ vars.STAGING_HOST }}" >> "$GITHUB_OUTPUT"
+            echo "env_name=staging" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Configure CI deploy key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${{ secrets.CI_DEPLOY_SSH_KEY }}" > ~/.ssh/ci_deploy_key
+          chmod 600 ~/.ssh/ci_deploy_key
+          ssh-keyscan -H "${{ steps.target.outputs.host }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Trigger deploy on ${{ steps.target.outputs.env_name }}
+        run: |
+          ssh -i ~/.ssh/ci_deploy_key -o BatchMode=yes -o ConnectTimeout=20 \
+            "ubuntu@${{ steps.target.outputs.host }}" "deploy"
+
+      - name: Clean up key
+        if: always()
+        run: rm -f ~/.ssh/ci_deploy_key

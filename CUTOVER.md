@@ -1,12 +1,19 @@
 # Odoo.sh → AWS — Cutover Runbook
 
-State after migration (both environments on **Odoo 19.0 Enterprise**, behind
-Cloudflare with Full (strict), origin locked to Cloudflare IP ranges):
+State after the current migration (both environments on **Odoo 19.0
+Enterprise**, behind Cloudflare with Full (strict), origin locked to Cloudflare
+IP ranges). This is a re-migrated **low-spec demo/test** environment
+(`t3.small` both sides, 10GB data volumes) — re-provision at production-grade
+specs before a real go-live if this is meant to become the actual production box:
 
 | Env | URL | EIP | Instance | DB | Status |
 |-----|-----|-----|----------|----|--------|
-| Production | https://syncoria-demo-master-aws-prod.syncoria.tech | 3.136.2.205 | t3.large | `main` | **Dormant** (crons/mail/payments OFF) until cutover |
-| Staging | https://syncoria-demo-master-aws-stg.syncoria.tech | 18.218.238.152 | t3.medium | `Staging` | Neutralized (safe test copy) |
+| Production | https://syncoria-demo-master-aws-prod.syncoria.tech | 18.189.200.228 | t3.small | `main` | **Live** — crons/mail/payments are currently ACTIVE, not neutralized (see checklist below) |
+| Staging | https://syncoria-demo-master-aws-stg.syncoria.tech | 3.148.14.253 | t3.small | `Staging` | Neutralized (safe test copy) |
+
+A demo admin user exists on both DBs (`admin@syncoria-demo-master.local`,
+password in `secrets/<env>-admin-user-password`) — decide whether to keep,
+disable, or rotate it before real go-live traffic starts.
 
 The AWS production copy is a **point-in-time snapshot**. odoo.sh keeps accumulating
 data until you cut over, so the steps below re-sync the delta at go-live.
@@ -16,12 +23,21 @@ data until you cut over, so the steps below re-sync the delta at go-live.
 ## Pre-cutover checklist
 
 - [ ] Stakeholders informed of a maintenance window.
-- [ ] Reconcile the earlier test run's side effects: confirm with the team whether
-      the 8 "Moneris Recurring Payment" jobs that fired during migration testing
-      hit the gateway (they may need voiding). Payment providers are currently
-      disabled on AWS prod, so nothing new is firing.
+- [ ] **Production is currently live, not neutralized** — this migration did not
+      disable crons/mail/payment providers on `main` (only `NEUTRALIZE_STAGING`
+      runs that logic, and only against `Staging`). The "Moneris Recurring
+      Payment" cron has fired (8 jobs completed) on production during restore/
+      restart in this test run, same as a prior run — confirm with the team
+      whether those hit the real gateway and need voiding. If this environment
+      should stay dormant until a deliberate go-live, disable it explicitly:
+      `UPDATE ir_cron SET active=false; UPDATE ir_mail_server SET active=false;`
+      (and disable payment providers in the UI) — do this before leaving the box
+      unattended, not after the fact.
 - [ ] Confirm nightly backups are running: `systemctl list-timers | grep odoo-backup`
 - [ ] Decide the real production hostname that will point at AWS.
+- [ ] Decide what happens to the demo admin user(s) created during testing
+      (`secrets/*-admin-user-password`) — keep, disable, or rotate before
+      real traffic starts.
 - [ ] Refresh your AWS SSO session and set `ODOOSH_PROD_SSH_HOST` is not needed
       (using `local_file` backup method).
 
@@ -39,15 +55,19 @@ data until you cut over, so the steps below re-sync the delta at go-live.
    ODOOSH_PROD_DUMP_FILE="$HOME/Downloads/<final-backup>.zip" \
      ./03-migrate-from-odoosh.sh production
    ```
-   Confirm a clean load:
+   Confirm a clean load (check `.state/production.env` or
+   `aws ec2 describe-addresses` for the current EIP if it's changed since this
+   was last written):
    ```bash
-   IP=3.136.2.205; KEY="secrets/syncoria-demo-master-key.pem"
+   IP=18.189.200.228; KEY="secrets/syncoria-demo-master-key.pem"
    ssh -i "$KEY" ubuntu@$IP 'curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8069/web/login; sudo tail -15 /var/log/odoo/odoo.log'
    ```
 
-4. **Wake production** (it was deliberately dormant):
+4. **Wake production** — only needed if you deliberately neutralized it per the
+   pre-cutover checklist above; if it was left live throughout testing, skip
+   straight to re-verifying payment providers:
    ```bash
-   ssh -i secrets/syncoria-demo-master-key.pem ubuntu@3.136.2.205 \
+   ssh -i secrets/syncoria-demo-master-key.pem ubuntu@18.189.200.228 \
      "sudo -u postgres psql -d main -c \"UPDATE ir_cron SET active=true; UPDATE ir_mail_server SET active=true;\" && sudo systemctl restart odoo"
    ```
    Re-enable and re-verify **payment providers in the Odoo UI deliberately**

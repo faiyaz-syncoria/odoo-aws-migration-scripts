@@ -90,12 +90,23 @@ checks `get-caller-identity` up front so you catch it before you start.
 |---|--------|-----------|--------------|
 | 0 | `00-preflight.sh` | Preflight | Validates tooling, AWS, GitHub access, version branch, backup/cert inputs, network. Changes nothing. |
 | 1 | `01-provision-aws.sh` | **AWS provisioning** | VPC, subnet, IGW, routes, security group, key pair, EC2 per env (your chosen specs), data EBS volume, Elastic IP. Idempotent (matches by Name tag). |
-| 2 | `02-deploy-odoo.sh` | **Deploy Odoo Enterprise** | PostgreSQL 16 + Odoo (chosen version) Enterprise on Python 3.12 + wkhtmltopdf + systemd. Clones `odoo` + `odoo/enterprise` at the target version. |
-| 3 | `03-migrate-from-odoosh.sh` | **Backup from odoo.sh & deploy** | Pulls DB + filestore, clones custom addons (with submodules), installs their Python deps, restores per env, runs a `-u all` schema reconcile, and neutralizes staging. Version-downgrade guard included. |
+| 2 | `02-deploy-odoo.sh` | **Deploy Odoo Enterprise** | PostgreSQL 16 + pgvector (required by Odoo 19+'s `ai` module) + Odoo (chosen version) Enterprise on Python 3.12 + wkhtmltopdf + systemd. Clones `odoo` + `odoo/enterprise` at the target version. |
+| 3 | `03-migrate-from-odoosh.sh` | **Backup from odoo.sh & deploy** | Pulls DB + filestore, clones custom addons (with submodules), installs their Python deps, restores per env (ensuring `unaccent`/`pg_trgm`/`pgvector` extensions exist and cleaning known orphaned `ai_topic` relation rows from the source dump), runs a `-u all` schema reconcile, and neutralizes staging. Version-downgrade guard included. |
 | 4 | `04-harden-and-tune.sh` | **Security hardening & fine tuning** | nginx reverse proxy + TLS (Cloudflare Origin or Let's Encrypt), Odoo worker + PostgreSQL tuning sized to the box, `dbfilter`/`list_db`, UFW, fail2ban, unattended-upgrades, SSH hardening, CloudWatch (where monitoring is on), nightly backups. |
 
 Run them individually, or `./run-all.sh` to chain all four with a validation
 gate between each.
+
+### Ongoing deploys (checkpoint 5 — separate from the four above)
+
+| # | Script | Checkpoint | What it does |
+|---|--------|-----------|--------------|
+| 5 | `05-update-addons.sh` | **Code-only deploy** | Pulls the latest custom addons from the matching odoo.sh branch, installs any new Python deps, and reconciles schema (`-u all` with per-module fallback) against the **existing** database. Never drops/recreates the DB, loads a dump, or touches the filestore — safe to run on every merge. |
+
+This is the one to automate for CI/CD (see below) — `03-migrate-from-odoosh.sh`
+recreates the whole database from a backup zip every time, which is correct
+for the initial migration or a deliberate data re-sync, but would destroy data
+if triggered on every push.
 
 ### Helper scripts
 
@@ -105,6 +116,40 @@ gate between each.
 | `99-teardown.sh` | Destroy all AWS resources for the project (instances, EIPs, data volumes, SG, subnet, IGW, VPC, key pair) + clear local state. Requires typed confirmation. Irreversible; odoo.sh untouched. |
 | `update-my-ip.sh` | Lock SSH (22) to your current public IP. Re-run when you change networks. NAT-safe: never revokes a manually-added broader rule. |
 | `restrict-web-to-cloudflare.sh` | Lock origin 80/443 to Cloudflare's IP ranges (when proxied). `--open` reverts. |
+| `setup-ci-deploy.sh` | Installs a **restricted** SSH deploy key (`secrets/ci-deploy-key`) so a CI pipeline can trigger `05-update-addons.sh` without getting general admin SSH access — server-side forced `command=` restriction, so even a leaked key can only run that one non-destructive deploy. See `ci-templates/deploy.yml` for the GitHub Actions side. |
+
+### Continuous deployment (auto-deploy on merge)
+
+To auto-deploy on every push to `main`/`Staging` in the odoo.sh addon repo:
+
+1. `./setup-ci-deploy.sh` — generates the restricted key and installs it on
+   both boxes (idempotent, safe to re-run).
+2. Copy `ci-templates/deploy.yml` into the addon repo at
+   `.github/workflows/deploy.yml`.
+3. On the addon repo, set the `CI_DEPLOY_SSH_KEY` secret (contents of
+   `secrets/ci-deploy-key`) and `PRODUCTION_HOST`/`STAGING_HOST` variables
+   (the current Elastic IPs).
+
+The key is scoped so it can *only* run the checkpoint-5 deploy — no shell
+access, no port forwarding, nothing else — even if the CI secret ever leaks.
+`04-harden-and-tune.sh` never touches `authorized_keys` (only the sshd
+`PasswordAuthentication`/`PermitRootLogin` settings), so it's safe to run
+`setup-ci-deploy.sh` before or after hardening — just run it after
+`02-deploy-odoo.sh` at minimum, since the wrapper it installs assumes
+`ODOO_HOME`/etc. already exist.
+
+**GitHub only triggers a push-workflow if the workflow file exists on the
+branch being pushed to** — adding it to `main` does *not* cover `Staging` (or
+vice versa). Add it to both branches (two small PRs, or merge one branch's
+addition into the other) if you want both to auto-deploy.
+
+If the environment is ever torn down and re-provisioned, the Elastic IPs
+change; update the `PRODUCTION_HOST`/`STAGING_HOST` repo variables (not the
+workflow file) and re-run `./setup-ci-deploy.sh` on the new boxes — the CI
+keypair itself doesn't need regenerating, only its server-side installation.
+`setup-ci-deploy.sh` also refreshes the persisted repo/branch/token config on
+each box every time it runs, so re-run it too after changing `ODOOSH_REPO_URL`,
+a branch name, or rotating `GITHUB_TOKEN`.
 
 ### Driving it with Claude Code
 
@@ -122,17 +167,21 @@ odoo-aws-migration/
 ├── 02-deploy-odoo.sh
 ├── 03-migrate-from-odoosh.sh
 ├── 04-harden-and-tune.sh
+├── 05-update-addons.sh       # non-destructive code-only deploy (for CI/CD)
 ├── run-all.sh                # orchestrator
 ├── 99-teardown.sh            # destroy all AWS resources (for a clean re-run)
 ├── update-my-ip.sh
 ├── restrict-web-to-cloudflare.sh
+├── setup-ci-deploy.sh        # installs a restricted CI deploy SSH key
 ├── CLAUDE.md                 # project context + rules for Claude Code
 ├── PROMPTS.md                # prompt library for Claude Code operations
 ├── CUTOVER.md                # go-live runbook
 ├── lib/common.sh             # shared helpers (logging, state, ssh, aws lookups)
+├── ci-templates/deploy.yml   # GitHub Actions template for the addon repo
 └── remote/                   # scripts executed ON the EC2 boxes
     ├── odoo-bootstrap.sh
     ├── odoo-restore.sh
+    ├── odoo-update-code.sh   # non-destructive deploy (used by 05 + CI)
     └── odoo-harden.sh
 ```
 
@@ -190,9 +239,20 @@ These are hardened in the scripts from real run experience:
 - **Quoted env files** so a value with a space (e.g. a pasted `ssh user@host`)
   can't break sourcing.
 - **NAT-aware SSH**: `update-my-ip.sh` only manages its own `/32`; add a broader
-  `/24` by hand for carrier-NAT networks and it won't be clobbered.
+  `/24` by hand for carrier-NAT networks and it won't be clobbered. If the public
+  IP is different on every single check, that's a rotating NAT pool — a `/32`
+  will never keep up with it.
 - **Data volume**: the data EBS volume is mounted at `/var/lib/odoo`, so the DB
   and filestore live on durable, resizable storage separate from the OS disk.
+- **pgvector for Odoo 19+**: `ai_embedding.embedding_vector` needs the `vector`
+  type. Bootstrap installs `postgresql-${PG_VERSION}-pgvector`; restore creates
+  the extension and cleans known orphaned `ai_agent_ai_topic_rel` rows (a
+  pre-existing inconsistency in some source odoo.sh dumps, not something the
+  restore introduces).
+- **`authorized_keys` edits are append-only, never filtered/rewritten.** A
+  remove-then-append approach can wipe every key on one bad match (an empty
+  pattern matches every line) and lock out SSH entirely — recovery needs EBS
+  root-volume surgery. `setup-ci-deploy.sh` only ever checks-then-appends.
 
 ## Security summary (checkpoint 4)
 
@@ -219,6 +279,14 @@ over. See **`CUTOVER.md`** for the go-live runbook (freeze odoo.sh → final bac
 - `column ... does not exist` after restore → the addon code is newer than the
   backup; the `-u all` reconcile handles it, or run `-u <module>` for the one
   named in the log.
+- `type "vector" does not exist` or `Model ai.embedding has no table` → the
+  `pgvector` extension is missing (Odoo 19+'s `ai` module needs it). Handled
+  automatically now; on a box provisioned before this fix, install
+  `postgresql-${PG_VERSION}-pgvector` and run `CREATE EXTENSION vector`
+  manually, then retry `-u ai`.
+- Scripting `res.users` groups on Odoo 19? The field is `group_ids`, not the
+  older `groups_id` — check the deployed version's field name before assuming
+  a script is wrong.
 
 > Version note: odoo.sh SSH host/backup mechanics and `odoo/enterprise` access
 > can change; verify against odoo.sh right before a run. Backup download links

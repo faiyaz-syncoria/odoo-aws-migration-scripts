@@ -16,6 +16,12 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
 - Flow: `configure.sh` → `00-preflight.sh` → `01-provision-aws.sh` →
   `02-deploy-odoo.sh` → `03-migrate-from-odoosh.sh` → `04-harden-and-tune.sh`.
   `run-all.sh` chains them; `99-teardown.sh` destroys everything.
+- `05-update-addons.sh` is a **non-destructive** ongoing-deploy path: pulls
+  latest custom addon code + Python deps and reconciles schema against the
+  *existing* database — no drop/recreate, unlike `03-migrate-from-odoosh.sh`.
+  Safe to trigger on every code merge. `setup-ci-deploy.sh` wires this up to
+  CI (see `ci-templates/deploy.yml` for the GitHub Actions side) via a
+  restricted, forced-command-only SSH key — never the main admin key.
 - Every script is **idempotent** (AWS matched by Name tag; remote steps re-apply
   cleanly) and **fails loudly** (no silent success). Re-running a failed step is
   the normal recovery.
@@ -33,8 +39,12 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
    SSO/temporary sessions expire (often hourly); refresh with `aws sso login` or
    fresh credentials. Checkpoints 2–4 use SSH and are unaffected by AWS expiry.
 3. **Secrets** — do not echo private keys, tokens, or DB passwords to the
-   terminal. When splitting/placing certs or keys, write to files and verify with
-   fingerprints/counts, not by printing contents.
+   terminal, or include them in any chat message, email, or other message sent
+   on the operator's behalf. When splitting/placing certs or keys, write to
+   files and verify with fingerprints/counts, not by printing contents. Default
+   to a file-path reference or a locally-run command the operator executes
+   themselves; only include an actual secret value directly if the operator
+   explicitly asks for that specific exception after you've flagged the risk.
 4. **SSH key** — reference it explicitly as `secrets/${PROJECT_NAME}-key.pem`,
    not `secrets/*.pem` (secrets/ may also hold a TLS cert `.pem`).
 5. **Pause after each checkpoint** so the operator can verify before continuing.
@@ -44,10 +54,14 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
 ## Known gotchas (already handled; watch for them)
 
 - **New Elastic IPs** on every fresh provision → Cloudflare A records must be
-  re-pointed to the new IPs before step 4.
+  re-pointed to the new IPs before step 4. Check first with
+  `dig +short <domain>` — DNS may already be correct and not need touching.
 - **Carrier/guest-NAT networks** rotate the public IP → a `/32` SSH rule fails;
   use `./update-my-ip.sh`, and for a NAT pool add a broader `/24` by hand (the
   helper won't clobber it). Outbound port 22 may be blocked on some networks.
+  If the IP is different on every single check (sample `checkip.amazonaws.com`
+  a few times in a row), that's a rotating NAT pool, not a fluke — a `/32` will
+  never keep up.
 - **odoo.sh production SSH is often admin-only** → default pull method is
   `local_file` (download the backup zip in a browser).
 - **`-u all` schema reconcile** can be rolled back by one module's RST/description
@@ -55,6 +69,34 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
 - **Cloudflare Full (strict)** needs a real origin cert → `TLS_MODE=cloudflare_origin`
   installs a Cloudflare Origin Certificate; origin 80/443 lock to Cloudflare via
   `restrict-web-to-cloudflare.sh`.
+- **Odoo 19+'s `ai` module needs `pgvector`** (`ai_embedding.embedding_vector` is
+  a `vector(1536)` column) → bootstrap installs `postgresql-${PG_VERSION}-pgvector`
+  and restore creates the extension automatically. A box provisioned before this
+  fix will show `type "vector" does not exist` or `Model ai.embedding has no
+  table` on `-u ai`; install the package and `CREATE EXTENSION vector` manually,
+  then retry.
+- **`ai_agent_ai_topic_rel` can carry orphaned rows** referencing `ai_topic` ids
+  that don't exist — a pre-existing inconsistency in the source odoo.sh dump,
+  not something the restore introduces. Restore now deletes these automatically;
+  if `-u ai` still fails on this table's foreign key, that's why.
+- **`res.users` group field renamed** in Odoo 19: `groups_id` → `group_ids`. Any
+  ad hoc user/group scripting (e.g. creating an admin user via `odoo-bin shell`)
+  must use the field name for the deployed version.
+- **Never filter/rewrite `authorized_keys`** — always append-only, check-then-
+  append. A prior version of `setup-ci-deploy.sh` tried to dedupe an entry with
+  `grep -v "${KEYBODY}"` inside a heredoc where `KEYBODY` silently evaluated
+  empty (nested local/remote variable expansion bug); `grep -v ""` matches
+  every line, so it wiped the admin key entirely and locked out SSH. Recovery
+  required stopping the instance and doing EBS root-volume surgery (attach the
+  root volume to another running box, fix the file, reattach). Any script that
+  touches `authorized_keys` must never use a remove/filter step — only ever
+  check whether a line is already present and append if not.
+- **GitHub only fires a push-triggered workflow if the workflow file already
+  exists on the branch being pushed to** — adding `ci-templates/deploy.yml` to
+  `main` doesn't cover `Staging` (or vice versa). Needs a companion PR/commit
+  on each branch. After a re-provision, re-run `setup-ci-deploy.sh` (new boxes
+  have empty `authorized_keys`) and update the addon repo's `PRODUCTION_HOST`/
+  `STAGING_HOST` variables — the CI keypair itself doesn't need regenerating.
 
 ## Verifying a healthy box
 
