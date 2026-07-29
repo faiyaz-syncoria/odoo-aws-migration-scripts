@@ -41,7 +41,9 @@ then `./run-all.sh production`.
 - **TLS**: if the site is proxied through **Cloudflare** (Full/Full-strict), a
   **Cloudflare Origin Certificate** (SSL/TLS → Origin Server). If direct DNS,
   Let's Encrypt via certbot instead.
-- Local tools: `jq git ssh scp curl openssl`.
+- Local tools: `jq git ssh scp curl openssl`. Optional: `gh` (GitHub CLI),
+  authenticated, only needed for `setup-ci-deploy.sh`'s CI/CD auto-deploy setup
+  (opening PRs, setting the deploy secret/variables) — not the core migration.
 - A network that permits **outbound SSH (port 22)** to the boxes (some
   guest/carrier networks block it — preflight warns).
 

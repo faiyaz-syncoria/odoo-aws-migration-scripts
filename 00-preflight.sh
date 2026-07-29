@@ -4,6 +4,7 @@
 # -----------------------------------------------------------------------------
 # Changes nothing. Catches the things that otherwise fail mid-run:
 #   - local tooling, AWS auth + region + EC2 permissions (AMI/instance-types)
+#   - gh (GitHub CLI) presence/auth - optional, only for setup-ci-deploy.sh
 #   - instance types valid in the region
 #   - GitHub token access to odoo/enterprise AND your project repo
 #   - the target Odoo version branch actually exists
@@ -33,9 +34,35 @@ checkpoint "0 - Preflight checks"
 
 # ---- 1. local tooling -------------------------------------------------------
 info "Local tooling"
-for c in aws jq ssh scp git curl openssl; do
+# aws gets its own check: must be v2 specifically (README requires it; v1 has
+# different flag/output behavior that can fail confusingly deep into a run
+# rather than clearly upfront).
+if have aws; then
+  aws_major="$(aws --version 2>&1 | sed -n 's#^aws-cli/\([0-9][0-9]*\)\..*#\1#p')"
+  if [[ "${aws_major}" == "2" ]]; then
+    pass "command: aws (v2)"
+  else
+    fail2 "aws CLI must be v2 (found: $(aws --version 2>&1 | head -1 | cut -d' ' -f1 || echo unknown)) - install AWS CLI v2"
+  fi
+else
+  fail2 "missing command: aws"
+fi
+for c in jq ssh scp git curl openssl; do
   if have "$c"; then pass "command: $c"; else fail2 "missing command: $c"; fi
 done
+
+# gh (GitHub CLI) is only needed for the OPTIONAL CI/CD auto-deploy setup
+# (setup-ci-deploy.sh's PR/secret/variable steps) - not the core migration, so
+# this warns rather than fails preflight.
+if have gh; then
+  if gh auth status >/dev/null 2>&1; then
+    pass "command: gh (authenticated)"
+  else
+    warn2 "gh installed but not authenticated - run 'gh auth login' before using setup-ci-deploy.sh"
+  fi
+else
+  warn2 "gh (GitHub CLI) not found - only needed for setup-ci-deploy.sh's CI/CD auto-deploy setup, not the core migration"
+fi
 
 # ---- 2. AWS auth + region + permissions ------------------------------------
 info "AWS"
