@@ -31,6 +31,12 @@ have(){ command -v "$1" >/dev/null 2>&1; }
 placeholder(){ local v="${1:-}"; [[ -z "${v}" || "${v}" == *CHANGE_ME* ]]; }
 
 checkpoint "0 - Preflight checks"
+INSTALL_MODE="${INSTALL_MODE:-migrate}"
+if [[ "${INSTALL_MODE}" == "fresh" ]]; then
+  info "INSTALL_MODE=fresh - odoo.sh source checks are skipped; checkpoint 3 will not run"
+else
+  info "INSTALL_MODE=migrate - full odoo.sh source validation applies"
+fi
 
 # ---- 1. local tooling -------------------------------------------------------
 info "Local tooling"
@@ -88,11 +94,14 @@ fi
 
 # ---- 3. core config present -------------------------------------------------
 info "Config completeness"
-for v in PROJECT_NAME AWS_REGION AWS_AZ ADMIN_ALLOWED_CIDR \
-         PRODUCTION_DOMAIN STAGING_DOMAIN \
-         GITHUB_USER GITHUB_TOKEN ODOO_VERSION \
-         ODOOSH_REPO_URL ODOOSH_PROD_DBNAME ODOOSH_STAGING_DBNAME \
-         TARGET_PROD_DBNAME TARGET_STAGING_DBNAME; do
+CORE_VARS=(PROJECT_NAME AWS_REGION AWS_AZ ADMIN_ALLOWED_CIDR \
+           PRODUCTION_DOMAIN STAGING_DOMAIN \
+           GITHUB_USER GITHUB_TOKEN ODOO_VERSION \
+           TARGET_PROD_DBNAME TARGET_STAGING_DBNAME)
+if [[ "${INSTALL_MODE}" == "migrate" ]]; then
+  CORE_VARS+=(ODOOSH_REPO_URL ODOOSH_PROD_DBNAME ODOOSH_STAGING_DBNAME)
+fi
+for v in "${CORE_VARS[@]}"; do
   if placeholder "${!v:-}"; then fail2 "config ${v} not set"; else pass "config ${v}"; fi
 done
 # CIDR sanity
@@ -107,27 +116,35 @@ gitok(){ # url  -> 0 if refs listed
 if placeholder "${GITHUB_USER:-}" || placeholder "${GITHUB_TOKEN:-}"; then
   fail2 "GITHUB_USER / GITHUB_TOKEN not set - cannot check repo access"
 else
+  # needed regardless of INSTALL_MODE: 02-deploy-odoo.sh clones odoo/enterprise
   gitok "odoo/enterprise" && pass "can access odoo/enterprise" || fail2 "cannot access odoo/enterprise (grant this GitHub account Enterprise access)"
-  # project repo (strip protocol + trailing .git, keep org/repo)
-  proj="${ODOOSH_REPO_URL#https://github.com/}"; proj="${proj%.git}"
-  if [[ "${ODOOSH_REPO_URL}" == https://github.com/* ]]; then
-    gitok "${proj}" && pass "can access ${proj}" || fail2 "cannot access project repo ${proj} with these credentials"
-  else warn2 "ODOOSH_REPO_URL is not an https github URL - skipping token access check"; fi
-  # target Odoo version branch exists
+  # target Odoo version branch exists - relevant regardless of mode
   if git ls-remote --heads "https://github.com/odoo/odoo.git" "${ODOO_VERSION}" 2>/dev/null | grep -q "${ODOO_VERSION}"; then
     pass "odoo/odoo has branch ${ODOO_VERSION}"
   else warn2 "could not confirm odoo/odoo branch ${ODOO_VERSION} (network or version typo?)"; fi
-  # branch names exist in the project repo
-  if [[ "${ODOOSH_REPO_URL}" == https://github.com/* ]]; then
-    for br in "${ODOOSH_PROD_BRANCH}" "${ODOOSH_STAGING_BRANCH}"; do
-      if git ls-remote --heads "https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${proj}.git" "${br}" 2>/dev/null | grep -q "refs/heads/${br}$"; then
-        pass "repo branch '${br}' exists"
-      else warn2 "repo branch '${br}' not found in ${proj} (addon clone will fall back to default)"; fi
-    done
+
+  if [[ "${INSTALL_MODE}" == "migrate" ]]; then
+    # project repo (strip protocol + trailing .git, keep org/repo)
+    proj="${ODOOSH_REPO_URL#https://github.com/}"; proj="${proj%.git}"
+    if [[ "${ODOOSH_REPO_URL}" == https://github.com/* ]]; then
+      gitok "${proj}" && pass "can access ${proj}" || fail2 "cannot access project repo ${proj} with these credentials"
+      # branch names exist in the project repo
+      for br in "${ODOOSH_PROD_BRANCH}" "${ODOOSH_STAGING_BRANCH}"; do
+        if git ls-remote --heads "https://${GITHUB_USER}:${GITHUB_TOKEN}@github.com/${proj}.git" "${br}" 2>/dev/null | grep -q "refs/heads/${br}$"; then
+          pass "repo branch '${br}' exists"
+        else warn2 "repo branch '${br}' not found in ${proj} (addon clone will fall back to default)"; fi
+      done
+    else warn2 "ODOOSH_REPO_URL is not an https github URL - skipping token access check"; fi
+  else
+    info "INSTALL_MODE=fresh - skipping odoo.sh project repo / branch checks"
   fi
 fi
 
 # ---- 5. pull-method inputs --------------------------------------------------
+if [[ "${INSTALL_MODE}" == "fresh" ]]; then
+  info "Backup source"
+  info "INSTALL_MODE=fresh - no odoo.sh backup source needed, skipping"
+else
 info "Backup source (${ODOOSH_PULL_METHOD})"
 case "${ODOOSH_PULL_METHOD}" in
   local_file)
@@ -148,6 +165,7 @@ case "${ODOOSH_PULL_METHOD}" in
     done ;;
   *) fail2 "ODOOSH_PULL_METHOD='${ODOOSH_PULL_METHOD}' invalid (local_file|ssh_dump|https_backup)";;
 esac
+fi
 
 # ---- 6. TLS inputs ----------------------------------------------------------
 info "TLS (${TLS_MODE:-letsencrypt})"
@@ -182,7 +200,11 @@ done
 
 echo
 if [[ "${FAILS}" -eq 0 ]]; then
-  ok "Preflight passed${WARNS:+ (${WARNS} warning(s) - review above)} - safe to run ./01-provision-aws.sh (or ./run-all.sh)"
+  if [[ "${INSTALL_MODE}" == "fresh" ]]; then
+    ok "Preflight passed${WARNS:+ (${WARNS} warning(s) - review above)} - safe to run ./01-provision-aws.sh (fresh install: run-all.sh will skip checkpoint 3)"
+  else
+    ok "Preflight passed${WARNS:+ (${WARNS} warning(s) - review above)} - safe to run ./01-provision-aws.sh (or ./run-all.sh)"
+  fi
 else
   die "Preflight found ${FAILS} blocking problem(s) and ${WARNS} warning(s) - fix the FAIL items above, then re-run."
 fi

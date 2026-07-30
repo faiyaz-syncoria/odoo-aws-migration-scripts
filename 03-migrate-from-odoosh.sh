@@ -21,6 +21,9 @@
 # =============================================================================
 source "$(dirname "$0")/lib/common.sh"
 load_config
+if [[ "${INSTALL_MODE:-migrate}" == "fresh" ]]; then
+  die "config.env has INSTALL_MODE=fresh (no odoo.sh source) - refusing to run this destructive DB-recreate step. Set INSTALL_MODE=migrate and fill in the odoo.sh source vars if you actually want to migrate data."
+fi
 require_no_placeholder ODOOSH_REPO_URL
 
 TARGET_ENVS=("$@"); [[ ${#TARGET_ENVS[@]} -eq 0 ]] && TARGET_ENVS=("${ENVIRONMENTS[@]}")

@@ -4,6 +4,8 @@
 # -----------------------------------------------------------------------------
 # Runs, in order, with a pause between checkpoints for validation:
 #   00 preflight -> 01 provision -> 02 deploy -> 03 migrate -> 04 harden
+# If config.env has INSTALL_MODE="fresh", checkpoint 3 (odoo.sh migration) is
+# skipped - the default empty Odoo Enterprise install from checkpoint 2 stands.
 #
 # Usage:
 #   ./run-all.sh                 # both environments, interactive gates
@@ -29,10 +31,15 @@ bash "${HERE}/01-provision-aws.sh" "${TARGET_ENVS[@]}"
 gate "AWS provisioned. Point DNS at the Elastic IPs now. Proceed to CHECKPOINT 2 (deploy Odoo)?"
 
 bash "${HERE}/02-deploy-odoo.sh" "${TARGET_ENVS[@]}"
-gate "Default Odoo deployed. Proceed to CHECKPOINT 3 (migrate from odoo.sh)?"
 
-bash "${HERE}/03-migrate-from-odoosh.sh" "${TARGET_ENVS[@]}"
-gate "Data migrated. Validate the apps. Proceed to CHECKPOINT 4 (harden + tune)?"
+if [[ "${INSTALL_MODE:-migrate}" == "fresh" ]]; then
+  info "INSTALL_MODE=fresh - skipping CHECKPOINT 3 (odoo.sh migration); the default empty Odoo install stays as-is"
+  gate "Default Odoo deployed (fresh install). Proceed to CHECKPOINT 4 (harden + tune)?"
+else
+  gate "Default Odoo deployed. Proceed to CHECKPOINT 3 (migrate from odoo.sh)?"
+  bash "${HERE}/03-migrate-from-odoosh.sh" "${TARGET_ENVS[@]}"
+  gate "Data migrated. Validate the apps. Proceed to CHECKPOINT 4 (harden + tune)?"
+fi
 
 bash "${HERE}/04-harden-and-tune.sh" "${TARGET_ENVS[@]}"
 

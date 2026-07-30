@@ -52,9 +52,10 @@ ask() {
 }
 ask_secret() {
   local k="$1" prompt="$2" def ans; def="$(cur "${k}")"
-  local shown="(unchanged)"; [[ -z "${def}" || "${def}" == *CHANGE_ME* ]] && shown="(none set)"
+  local shown="(unchanged)"
+  if [[ -z "${def}" || "${def}" == *CHANGE_ME* ]]; then shown="(none set)"; fi
   read -r -s -p "${prompt} ${shown}: " ans || true; echo
-  [[ -n "${ans}" ]] && setk "${k}" "${ans}"
+  if [[ -n "${ans}" ]]; then setk "${k}" "${ans}"; fi
 }
 # ask_menu KEY "Prompt" opt1 opt2 ...  (default = current value if it matches)
 ask_menu() {
@@ -75,11 +76,18 @@ echo "${B}Odoo.sh -> AWS migration : interactive configuration${R}"
 echo "Press Enter to keep the value shown in [brackets]. Ctrl-C to abort."
 
 # -----------------------------------------------------------------------------
+hdr "Install mode"
+say "migrate = full odoo.sh -> AWS data migration.  fresh = brand-new, empty Odoo Enterprise instance, no odoo.sh source."
+ask_menu INSTALL_MODE "Install mode" "migrate" "fresh"
+FRESH_INSTALL=0
+if [[ "$(cur INSTALL_MODE)" == "fresh" ]]; then FRESH_INSTALL=1; fi
+
+# -----------------------------------------------------------------------------
 hdr "Project & AWS"
 ask PROJECT_NAME     "Project name (prefix for all AWS resources)"
 ask_menu AWS_REGION  "AWS region" "us-east-2" "us-east-1" "us-west-2" "ca-central-1" "eu-west-1"
 # default the AZ to <region>a if not already set
-[[ -z "$(cur AWS_AZ)" || "$(cur AWS_AZ)" == *CHANGE_ME* ]] && setk AWS_AZ "$(cur AWS_REGION)a"
+if [[ -z "$(cur AWS_AZ)" || "$(cur AWS_AZ)" == *CHANGE_ME* ]]; then setk AWS_AZ "$(cur AWS_REGION)a"; fi
 ask AWS_AZ           "Availability zone"
 ask AWS_PROFILE      "AWS CLI profile (blank = default chain)"
 
@@ -118,35 +126,43 @@ ask GITHUB_USER  "GitHub username with odoo/enterprise access"
 ask_secret GITHUB_TOKEN "GitHub Personal Access Token (repo scope)"
 
 # -----------------------------------------------------------------------------
-hdr "odoo.sh source"
-ask ODOOSH_REPO_URL      "odoo.sh project git repo (https://github.com/org/repo.git)"
-ask ODOOSH_PROD_BRANCH   "Production branch name in that repo"
-ask ODOOSH_STAGING_BRANCH "Staging branch name in that repo"
-ask ODOOSH_PROD_DBNAME   "Source PRODUCTION database name (on odoo.sh)"
-ask ODOOSH_STAGING_DBNAME "Source STAGING database name (on odoo.sh)"
+hdr "Target database names"
 ask TARGET_PROD_DBNAME   "Target PRODUCTION db name (created on AWS)"
 ask TARGET_STAGING_DBNAME "Target STAGING db name (created on AWS)"
+say "Note: for a fresh install, create the DB with this exact name via Odoo's own database manager after checkpoint 2 - checkpoint 4 pins dbfilter to it."
 
-ask_menu ODOOSH_PULL_METHOD "How to fetch the DB+filestore from odoo.sh" "local_file" "ssh_dump" "https_backup"
-method="$(cur ODOOSH_PULL_METHOD)"
-case "${method}" in
-  local_file)
-    say "You'll download the backup .zip from odoo.sh (Branch > Backups > Download)."
-    ask ODOOSH_PROD_DUMP_FILE    "Local path to PRODUCTION backup .zip"
-    ask ODOOSH_STAGING_DUMP_FILE "Local path to STAGING backup .zip (blank to seed staging from prod later)"
-    ;;
-  ssh_dump)
-    ask ODOOSH_PROD_SSH_HOST     "odoo.sh PRODUCTION SSH host (build_id@host)"
-    ask ODOOSH_STAGING_SSH_HOST  "odoo.sh STAGING SSH host (build_id@host)"
-    ask ODOOSH_SSH_KEY           "Path to odoo.sh-registered SSH private key"
-    ;;
-  https_backup)
-    ask ODOOSH_PROD_DUMP_URL     "Signed PRODUCTION backup URL"
-    ask ODOOSH_STAGING_DUMP_URL  "Signed STAGING backup URL"
-    ;;
-esac
-ask_menu NEUTRALIZE_STAGING "Neutralize staging (disable mail/crons/payments)" "true" "false"
-ask_menu RECONCILE_MODULES  "Post-restore schema reconcile" "all" "off"
+if [[ "${FRESH_INSTALL}" -eq 1 ]]; then
+  hdr "odoo.sh source"
+  say "Fresh install selected - skipping odoo.sh source questions (no data migration)."
+else
+  hdr "odoo.sh source"
+  ask ODOOSH_REPO_URL      "odoo.sh project git repo (https://github.com/org/repo.git)"
+  ask ODOOSH_PROD_BRANCH   "Production branch name in that repo"
+  ask ODOOSH_STAGING_BRANCH "Staging branch name in that repo"
+  ask ODOOSH_PROD_DBNAME   "Source PRODUCTION database name (on odoo.sh)"
+  ask ODOOSH_STAGING_DBNAME "Source STAGING database name (on odoo.sh)"
+
+  ask_menu ODOOSH_PULL_METHOD "How to fetch the DB+filestore from odoo.sh" "local_file" "ssh_dump" "https_backup"
+  method="$(cur ODOOSH_PULL_METHOD)"
+  case "${method}" in
+    local_file)
+      say "You'll download the backup .zip from odoo.sh (Branch > Backups > Download)."
+      ask ODOOSH_PROD_DUMP_FILE    "Local path to PRODUCTION backup .zip"
+      ask ODOOSH_STAGING_DUMP_FILE "Local path to STAGING backup .zip (blank to seed staging from prod later)"
+      ;;
+    ssh_dump)
+      ask ODOOSH_PROD_SSH_HOST     "odoo.sh PRODUCTION SSH host (build_id@host)"
+      ask ODOOSH_STAGING_SSH_HOST  "odoo.sh STAGING SSH host (build_id@host)"
+      ask ODOOSH_SSH_KEY           "Path to odoo.sh-registered SSH private key"
+      ;;
+    https_backup)
+      ask ODOOSH_PROD_DUMP_URL     "Signed PRODUCTION backup URL"
+      ask ODOOSH_STAGING_DUMP_URL  "Signed STAGING backup URL"
+      ;;
+  esac
+  ask_menu NEUTRALIZE_STAGING "Neutralize staging (disable mail/crons/payments)" "true" "false"
+  ask_menu RECONCILE_MODULES  "Post-restore schema reconcile" "all" "off"
+fi
 
 # -----------------------------------------------------------------------------
 hdr "TLS / edge"
@@ -183,13 +199,19 @@ fi
 chmod 600 "${CFG}"
 hdr "Summary"
 cat <<SUM
+  Mode        : $(cur INSTALL_MODE)
   Project     : $(cur PROJECT_NAME)   Region: $(cur AWS_REGION) / $(cur AWS_AZ)
   Production  : $(cur PRODUCTION_INSTANCE_TYPE), $(cur PRODUCTION_EBS_GB)GB $(cur EBS_VOLUME_TYPE), monitoring=$(cur PRODUCTION_MONITORING), $(cur PRODUCTION_DOMAIN)
   Staging     : $(cur STAGING_INSTANCE_TYPE), $(cur STAGING_EBS_GB)GB $(cur EBS_VOLUME_TYPE), monitoring=$(cur STAGING_MONITORING), $(cur STAGING_DOMAIN)
-  Odoo        : $(cur ODOO_VERSION) enterprise | source repo $(cur ODOOSH_REPO_URL)
-  Pull method : $(cur ODOOSH_PULL_METHOD) | reconcile=$(cur RECONCILE_MODULES) | neutralize staging=$(cur NEUTRALIZE_STAGING)
+  Odoo        : $(cur ODOO_VERSION) enterprise
   TLS         : $(cur TLS_MODE)
   Config      : ${CFG}
 SUM
+if [[ "${FRESH_INSTALL}" -eq 1 ]]; then
+  echo "  odoo.sh     : (skipped - fresh install, checkpoint 3 will not run)"
+else
+  echo "  Source repo : $(cur ODOOSH_REPO_URL)"
+  echo "  Pull method : $(cur ODOOSH_PULL_METHOD) | reconcile=$(cur RECONCILE_MODULES) | neutralize staging=$(cur NEUTRALIZE_STAGING)"
+fi
 echo
 say "Next:  ./00-preflight.sh   then   ./run-all.sh"
