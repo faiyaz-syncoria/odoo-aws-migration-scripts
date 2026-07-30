@@ -296,6 +296,23 @@ SQL
 fi
 
 # -----------------------------------------------------------------------------
+# 5b. Optional hold: disable cron/mail/payments BEFORE Odoo ever starts, so the
+#     cron poller can't fire a live job (e.g. a recurring payment) on first boot.
+#     Applies regardless of NEUTRALIZE - this only pauses outbound automation,
+#     it does not run Odoo's broader neutralize (no data scrubbing, reversible
+#     by flipping these back to true/enabled deliberately).
+# -----------------------------------------------------------------------------
+if [[ "${HOLD_BEFORE_START:-no}" == "yes" ]]; then
+  log "HOLD_BEFORE_START set - disabling cron/mail/payments before first start"
+  ${PSQL} -d "${TARGET_DBNAME}" -v ON_ERROR_STOP=0 <<'SQL'
+UPDATE ir_cron SET active = false;
+UPDATE ir_mail_server SET active = false;
+UPDATE fetchmail_server SET active = false;
+UPDATE payment_provider SET state = 'disabled' WHERE state IS DISTINCT FROM 'disabled';
+SQL
+fi
+
+# -----------------------------------------------------------------------------
 # 6. Ownership + restart + module list refresh
 # -----------------------------------------------------------------------------
 chown -R "${ODOO_USER}:${ODOO_USER}" /var/lib/odoo
