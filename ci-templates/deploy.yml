@@ -11,21 +11,36 @@
 # One-time setup before this workflow can run:
 #   1. In odoo-aws-migration-scripts: ./setup-ci-deploy.sh
 #      (installs the forced-command SSH restriction on both boxes)
-#   2. In THIS repo (syncoria/syncoria-Demo-Master), set:
+#   2. In odoo-aws-migration-scripts: ./setup-ci-aws-access.sh
+#      (creates a GitHub OIDC identity provider + IAM role in AWS, scoped to
+#      ONLY authorize/revoke SSH ingress on the one project security group -
+#      needed because the SG intentionally only allows SSH from the
+#      operator's own IP, and GitHub-hosted runners come from Azure's IP
+#      space and can never match it. No static AWS access key is ever
+#      stored - the workflow exchanges a short-lived OIDC token for
+#      temporary credentials on every run.)
+#   3. In THIS repo (syncoria/syncoria-Demo-Master), set:
 #      - Secret   CI_DEPLOY_SSH_KEY  = contents of secrets/ci-deploy-key
 #      - Variable PRODUCTION_HOST    = current production Elastic IP
 #      - Variable STAGING_HOST       = current staging Elastic IP
+#      - Variable AWS_ROLE_ARN       = printed by setup-ci-aws-access.sh
+#      - Variable SECURITY_GROUP_ID  = printed by setup-ci-aws-access.sh
+#      - Variable AWS_REGION         = printed by setup-ci-aws-access.sh
 #      Example (run from the toolkit repo, never prints the key):
 #        gh secret set CI_DEPLOY_SSH_KEY --repo syncoria/syncoria-Demo-Master < secrets/ci-deploy-key
 #        gh variable set PRODUCTION_HOST --repo syncoria/syncoria-Demo-Master --body "<production EIP>"
 #        gh variable set STAGING_HOST    --repo syncoria/syncoria-Demo-Master --body "<staging EIP>"
+#        (AWS_ROLE_ARN / SECURITY_GROUP_ID / AWS_REGION: use the gh variable set
+#         commands setup-ci-aws-access.sh prints for you)
 #
 # IMPORTANT: Elastic IPs change if the environment is ever torn down and
 # re-provisioned (./99-teardown.sh + ./01-provision-aws.sh). Update the
 # PRODUCTION_HOST / STAGING_HOST repo variables after any re-provision, or
 # this workflow will fail to connect. Also re-run ./setup-ci-deploy.sh on the
 # new boxes - the keypair itself doesn't change, but its server-side
-# installation does (a fresh instance has an empty authorized_keys).
+# installation does (a fresh instance has an empty authorized_keys). If the
+# security group itself is ever recreated, re-run ./setup-ci-aws-access.sh
+# too and update SECURITY_GROUP_ID.
 #
 # IMPORTANT: GitHub only fires a push-triggered workflow if the workflow file
 # already exists on the branch being pushed to. Adding this to `main` does NOT
@@ -52,6 +67,10 @@ concurrency:
   group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
 
+permissions:
+  id-token: write   # required for AWS OIDC token exchange
+  contents: read
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -67,6 +86,22 @@ jobs:
             echo "env_name=staging" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Assume scoped AWS role (OIDC, no static keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Open a temporary SSH rule for this runner's IP
+        id: runner_ip
+        run: |
+          MY_IP="$(curl -fsS https://checkip.amazonaws.com)"
+          echo "ip=${MY_IP}" >> "$GITHUB_OUTPUT"
+          aws ec2 authorize-security-group-ingress \
+            --group-id "${{ vars.SECURITY_GROUP_ID }}" \
+            --protocol tcp --port 22 --cidr "${MY_IP}/32" \
+            || echo "Rule may already exist - continuing"
+
       - name: Configure CI deploy key
         run: |
           mkdir -p ~/.ssh
@@ -75,10 +110,26 @@ jobs:
           ssh-keyscan -H "${{ steps.target.outputs.host }}" >> ~/.ssh/known_hosts 2>/dev/null
 
       - name: Trigger deploy on ${{ steps.target.outputs.env_name }}
+        timeout-minutes: 20
         run: |
+          # ServerAliveInterval/CountMax: the remote deploy redirects its own
+          # output to a log file, so this SSH session sees nothing for
+          # minutes at a stretch during the schema reconcile - long enough
+          # for an idle NAT/firewall between the runner and AWS to drop the
+          # connection. Periodic keepalive probes keep packets flowing so
+          # that doesn't happen.
           ssh -i ~/.ssh/ci_deploy_key -o BatchMode=yes -o ConnectTimeout=20 \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
             "ubuntu@${{ steps.target.outputs.host }}" "deploy"
 
       - name: Clean up key
         if: always()
         run: rm -f ~/.ssh/ci_deploy_key
+
+      - name: Revoke the temporary SSH rule
+        if: always()
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "${{ vars.SECURITY_GROUP_ID }}" \
+            --protocol tcp --port 22 --cidr "${{ steps.runner_ip.outputs.ip }}/32" \
+            || echo "Rule may already be gone - continuing"

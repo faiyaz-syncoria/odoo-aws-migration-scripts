@@ -4,6 +4,10 @@ Automated, checkpoint-based migration of an Odoo instance from **odoo.sh** to
 **AWS**, one **single box per environment** (Odoo app + PostgreSQL on the same
 VM), with **Production** and **Staging** under one AWS project.
 
+The same toolkit also stands up a **brand-new, empty Odoo Enterprise instance**
+with no odoo.sh source at all — set `INSTALL_MODE="fresh"` in `config.env` (see
+[Fresh install](#fresh-install-no-odoosh-source) below).
+
 Everything is driven by `config.env` and runs from bash + the AWS CLI. Designed
 to run **seamlessly on a fresh project**: an interactive configurator collects
 every choice, a comprehensive preflight validates every prerequisite, and each
@@ -25,6 +29,11 @@ aws sts get-caller-identity   #    confirm the session is live
 Recommended: prove it end-to-end on staging first — `./run-all.sh staging` —
 then `./run-all.sh production`.
 
+Doing a **fresh install** instead of a migration? Same flow — at `configure.sh`'s
+"Install mode" prompt choose **fresh**. `configure.sh` then skips every odoo.sh
+question, and `run-all.sh` skips checkpoint 3 automatically. See
+[Fresh install](#fresh-install-no-odoosh-source).
+
 ---
 
 ## Prerequisites (fix these before you start — preflight checks them all)
@@ -33,14 +42,19 @@ then `./run-all.sh production`.
   `ec2:DescribeImages` + `ec2:DescribeInstanceTypes`. Keep the session fresh; if
   you use SSO, `aws sso login` before long AWS-touching steps.
 - **GitHub PAT (classic, `repo` scope)** on an account that has **`odoo/enterprise`
-  access** (tied to your Odoo Enterprise subscription) **and** access to your
-  odoo.sh **project repo**. Preflight verifies both.
-- **The DB + filestore from odoo.sh.** Production SSH on odoo.sh is often
-  admin-only, so the default and most reliable method is `local_file`: download
-  the backup `.zip` from odoo.sh → Branch → **Backups → Download**.
+  access** (tied to your Odoo Enterprise subscription). Required in **both**
+  install modes — checkpoint 2 clones `odoo/enterprise` regardless of whether
+  you're migrating or doing a fresh install. **Migrate mode only:** the same
+  account also needs access to your odoo.sh **project repo**; preflight
+  verifies both.
+- **Migrate mode only — the DB + filestore from odoo.sh.** Production SSH on
+  odoo.sh is often admin-only, so the default and most reliable method is
+  `local_file`: download the backup `.zip` from odoo.sh → Branch →
+  **Backups → Download**. Not needed for a fresh install — skip this entirely.
 - **TLS**: if the site is proxied through **Cloudflare** (Full/Full-strict), a
   **Cloudflare Origin Certificate** (SSL/TLS → Origin Server). If direct DNS,
-  Let's Encrypt via certbot instead.
+  Let's Encrypt via certbot instead. Needed either way — checkpoint 4 runs
+  regardless of install mode.
 - Local tools: `jq git ssh scp curl openssl`. Optional: `gh` (GitHub CLI),
   authenticated, only needed for `setup-ci-deploy.sh`'s CI/CD auto-deploy setup
   (opening PRs, setting the deploy secret/variables) — not the core migration.
@@ -93,11 +107,40 @@ checks `get-caller-identity` up front so you catch it before you start.
 | 0 | `00-preflight.sh` | Preflight | Validates tooling, AWS, GitHub access, version branch, backup/cert inputs, network. Changes nothing. |
 | 1 | `01-provision-aws.sh` | **AWS provisioning** | VPC, subnet, IGW, routes, security group, key pair, EC2 per env (your chosen specs), data EBS volume, Elastic IP. Idempotent (matches by Name tag). |
 | 2 | `02-deploy-odoo.sh` | **Deploy Odoo Enterprise** | PostgreSQL 16 + pgvector (required by Odoo 19+'s `ai` module) + Odoo (chosen version) Enterprise on Python 3.12 + wkhtmltopdf + systemd. Clones `odoo` + `odoo/enterprise` at the target version. |
-| 3 | `03-migrate-from-odoosh.sh` | **Backup from odoo.sh & deploy** | Pulls DB + filestore, clones custom addons (with submodules), installs their Python deps, restores per env (ensuring `unaccent`/`pg_trgm`/`pgvector` extensions exist and cleaning known orphaned `ai_topic` relation rows from the source dump), runs a `-u all` schema reconcile, and neutralizes staging. Version-downgrade guard included. |
+| 3 | `03-migrate-from-odoosh.sh` | **Backup from odoo.sh & deploy** *(migrate mode only — skipped for fresh installs)* | Pulls DB + filestore, clones custom addons (with submodules), installs their Python deps, restores per env (ensuring `unaccent`/`pg_trgm`/`pgvector` extensions exist and cleaning known orphaned `ai_topic` relation rows from the source dump), runs a `-u all` schema reconcile, and neutralizes staging. Version-downgrade guard included. |
 | 4 | `04-harden-and-tune.sh` | **Security hardening & fine tuning** | nginx reverse proxy + TLS (Cloudflare Origin or Let's Encrypt), Odoo worker + PostgreSQL tuning sized to the box, `dbfilter`/`list_db`, UFW, fail2ban, unattended-upgrades, SSH hardening, CloudWatch (where monitoring is on), nightly backups. |
 
 Run them individually, or `./run-all.sh` to chain all four with a validation
 gate between each.
+
+### Fresh install (no odoo.sh source)
+
+Set `INSTALL_MODE="fresh"` in `config.env` (or choose **fresh** at
+`configure.sh`'s "Install mode" prompt) to stand up a brand-new, empty Odoo
+Enterprise instance with no data migration:
+
+- `configure.sh` skips every odoo.sh-source question (repo URL, branches,
+  source DB names, pull method, neutralize/reconcile settings) — it only asks
+  for `TARGET_PROD_DBNAME`/`TARGET_STAGING_DBNAME`, since checkpoint 4 still
+  needs a DB name to pin `dbfilter` to.
+- `00-preflight.sh` skips the odoo.sh project-repo/branch checks and the
+  backup-source section. It still requires GitHub `odoo/enterprise` access
+  (checkpoint 2 needs it regardless of mode) and validates everything else
+  (AWS, instance types, TLS, network) exactly as in migrate mode.
+- `run-all.sh` runs checkpoints 0 → 1 → 2 → 4, automatically skipping
+  checkpoint 3.
+- `03-migrate-from-odoosh.sh` refuses to run directly against a fresh-install
+  config (it recreates the database from a backup — destructive, and there is
+  no backup to restore in fresh mode).
+- After checkpoint 2, Odoo comes up on the default database-selector/
+  create-database screen. Create the database yourself there, using the exact
+  name you gave `TARGET_PROD_DBNAME`/`TARGET_STAGING_DBNAME` — checkpoint 4's
+  `dbfilter` is pinned to that name.
+- Checkpoint 4 (hardening/tuning) runs the same as in migrate mode.
+
+To switch a project from fresh to a real migration later, edit `INSTALL_MODE`
+back to `"migrate"` in `config.env`, fill in the odoo.sh source vars, and run
+`./configure.sh` again (or edit `config.env` by hand) before `03-migrate-from-odoosh.sh`.
 
 ### Ongoing deploys (checkpoint 5 — separate from the four above)
 
@@ -119,21 +162,34 @@ if triggered on every push.
 | `update-my-ip.sh` | Lock SSH (22) to your current public IP. Re-run when you change networks. NAT-safe: never revokes a manually-added broader rule. |
 | `restrict-web-to-cloudflare.sh` | Lock origin 80/443 to Cloudflare's IP ranges (when proxied). `--open` reverts. |
 | `setup-ci-deploy.sh` | Installs a **restricted** SSH deploy key (`secrets/ci-deploy-key`) so a CI pipeline can trigger `05-update-addons.sh` without getting general admin SSH access — server-side forced `command=` restriction, so even a leaked key can only run that one non-destructive deploy. See `ci-templates/deploy.yml` for the GitHub Actions side. |
+| `setup-ci-aws-access.sh` | Creates a GitHub OIDC identity provider + IAM role/policy in AWS so CI can open/close a temporary SSH rule for its own runner IP, without ever storing a static AWS access key. Scoped to `ec2:Authorize/RevokeSecurityGroupIngress` on the one project security group only. Prints the `gh variable set` commands for `AWS_ROLE_ARN`/`SECURITY_GROUP_ID`/`AWS_REGION` afterward. Needs an AWS identity with IAM write access to run (`iam:CreateRole`, `iam:CreatePolicy`, `iam:AttachRolePolicy`, `iam:CreateOpenIDConnectProvider`) — a separate, more privileged grant than day-to-day EC2 admin. |
 
 ### Continuous deployment (auto-deploy on merge)
 
+The security group only allows SSH from the operator's own IP (see
+`update-my-ip.sh`) — GitHub-hosted Actions runners come from Azure's IP space
+and can never match it. So this needs two pieces: a restricted SSH key for the
+deploy itself, and a way for CI to open a temporary hole in the SG for its own
+runner IP and close it again afterward.
+
 To auto-deploy on every push to `main`/`Staging` in the odoo.sh addon repo:
 
-1. `./setup-ci-deploy.sh` — generates the restricted key and installs it on
-   both boxes (idempotent, safe to re-run).
-2. Copy `ci-templates/deploy.yml` into the addon repo at
+1. `./setup-ci-deploy.sh` — generates the restricted SSH key and installs it
+   on both boxes (idempotent, safe to re-run).
+2. `./setup-ci-aws-access.sh` — sets up the OIDC-based temporary SSH rule
+   access described above (needs IAM write permissions - see the helper
+   scripts table).
+3. Copy `ci-templates/deploy.yml` into the addon repo at
    `.github/workflows/deploy.yml`.
-3. On the addon repo, set the `CI_DEPLOY_SSH_KEY` secret (contents of
-   `secrets/ci-deploy-key`) and `PRODUCTION_HOST`/`STAGING_HOST` variables
-   (the current Elastic IPs).
+4. On the addon repo, set: `CI_DEPLOY_SSH_KEY` secret (contents of
+   `secrets/ci-deploy-key`), and `PRODUCTION_HOST`/`STAGING_HOST`/
+   `AWS_ROLE_ARN`/`SECURITY_GROUP_ID`/`AWS_REGION` variables (steps 1 and 2
+   print the exact values).
 
-The key is scoped so it can *only* run the checkpoint-5 deploy — no shell
+The SSH key is scoped so it can *only* run the checkpoint-5 deploy — no shell
 access, no port forwarding, nothing else — even if the CI secret ever leaks.
+The AWS role is scoped so it can *only* authorize/revoke SSH ingress on this
+one security group — no static AWS credential is ever stored anywhere.
 `04-harden-and-tune.sh` never touches `authorized_keys` (only the sshd
 `PasswordAuthentication`/`PermitRootLogin` settings), so it's safe to run
 `setup-ci-deploy.sh` before or after hardening — just run it after
@@ -151,7 +207,27 @@ workflow file) and re-run `./setup-ci-deploy.sh` on the new boxes — the CI
 keypair itself doesn't need regenerating, only its server-side installation.
 `setup-ci-deploy.sh` also refreshes the persisted repo/branch/token config on
 each box every time it runs, so re-run it too after changing `ODOOSH_REPO_URL`,
-a branch name, or rotating `GITHUB_TOKEN`.
+a branch name, or rotating `GITHUB_TOKEN`. If the security group itself is
+ever recreated, re-run `setup-ci-aws-access.sh` too and update
+`SECURITY_GROUP_ID`.
+
+**Two non-obvious IAM/network things this took a few rounds to get right**
+(already fixed in the current `ci-templates/deploy.yml` and
+`setup-ci-aws-access.sh` — worth knowing if you're touching either):
+- AWS authorizes `Authorize`/`RevokeSecurityGroupIngress` against a
+  `security-group-rule` resource (wildcarded, since a new/removed rule has no
+  ID yet) *in addition to* the `security-group` resource — a policy scoped to
+  only the `security-group` ARN gets `UnauthorizedOperation`. Tagging the new
+  rule for readability also needs a separate `ec2:CreateTags` grant on that
+  same wildcard resource; not worth it for a cosmetic label, so the workflow
+  doesn't tag the rule at all.
+- The remote deploy script redirects its own output to a log file, so the SSH
+  session sees nothing for the several minutes a full `-u all` reconcile takes
+  — long enough for an idle NAT/firewall between the runner and AWS to kill
+  the connection mid-deploy, potentially leaving Odoo stopped if that happens
+  right before the final `systemctl start odoo`. The workflow's SSH command
+  sets `ServerAliveInterval`/`ServerAliveCountMax` to keep packets flowing
+  during silent stretches.
 
 ### Driving it with Claude Code
 
@@ -175,6 +251,7 @@ odoo-aws-migration/
 ├── update-my-ip.sh
 ├── restrict-web-to-cloudflare.sh
 ├── setup-ci-deploy.sh        # installs a restricted CI deploy SSH key
+├── setup-ci-aws-access.sh    # OIDC role for CI's temporary SSH SG rule
 ├── CLAUDE.md                 # project context + rules for Claude Code
 ├── PROMPTS.md                # prompt library for Claude Code operations
 ├── CUTOVER.md                # go-live runbook
@@ -191,6 +268,9 @@ odoo-aws-migration/
 
 ## Key configuration choices (`config.env`)
 
+- **`INSTALL_MODE`** — `migrate` (default, full odoo.sh → AWS data migration) or
+  `fresh` (brand-new, empty Odoo Enterprise install, no odoo.sh source —
+  checkpoint 3 is skipped). See [Fresh install](#fresh-install-no-odoosh-source).
 - **Instance specs per environment** — `PRODUCTION_INSTANCE_TYPE`,
   `PRODUCTION_EBS_GB`, `PRODUCTION_MONITORING`, `PRODUCTION_TENANCY`, and the
   `STAGING_*` equivalents. Chosen interactively in `configure.sh` and validated

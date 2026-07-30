@@ -186,38 +186,60 @@ bottom for gotchas that keep coming up in practice.
 ## 6. Continuous deployment (auto-deploy on merge)
 
 **Set up CI/CD for the first time:**
-> Run `./setup-ci-deploy.sh` for both environments. This generates a
+> Run `./setup-ci-deploy.sh` for both environments — this generates a
 > restricted SSH key (`secrets/ci-deploy-key`) and installs it on each box with
 > a forced `command=` restriction so it can only ever run the non-destructive
-> `05-update-addons.sh` deploy — verify this by trying an unrelated command
-> over SSH with that key (e.g. `whoami`) and confirming only the deploy runs,
-> nothing else. Then draft/apply `ci-templates/deploy.yml` to the odoo.sh addon
-> repo (ask me first how to deliver it — direct push, a PR, or hand it to me —
-> since that's a different repo than this one), and tell me the exact
-> `gh secret set` / `gh variable set` commands to run for `CI_DEPLOY_SSH_KEY`,
-> `PRODUCTION_HOST`, and `STAGING_HOST` (current Elastic IPs). Never print the
-> key's contents.
+> `05-update-addons.sh` deploy. Verify this by trying an unrelated command over
+> SSH with that key (e.g. `whoami`) and confirming only the deploy runs,
+> nothing else. Then run `./setup-ci-aws-access.sh` — this needs an AWS
+> identity with IAM write access (`iam:CreateRole`, `CreatePolicy`,
+> `AttachRolePolicy`, `CreateOpenIDConnectProvider`); if it's denied under my
+> current session, tell me exactly which action failed and ask me to either
+> grant it or run the script myself, don't try to route around it. It sets up
+> an OIDC role so CI can open/close a temporary SSH rule for its own runner IP
+> (no static AWS key ever stored) — the SG only allows the operator's own IP,
+> and GitHub-hosted runners can't reach it otherwise. Then draft/apply
+> `ci-templates/deploy.yml` to the odoo.sh addon repo (ask me first how to
+> deliver it — direct push, a PR, or hand it to me — since that's a different
+> repo than this one, and check both `main` and `Staging` need the file
+> separately), and tell me the exact `gh secret set`/`gh variable set` commands
+> for `CI_DEPLOY_SSH_KEY`, `PRODUCTION_HOST`, `STAGING_HOST`, `AWS_ROLE_ARN`,
+> `SECURITY_GROUP_ID`, and `AWS_REGION` (the last three are printed by
+> `setup-ci-aws-access.sh`). Never print the SSH key's contents.
 
-**After a re-provision (Elastic IPs changed):**
-> The AWS environment was just re-provisioned and the Elastic IPs changed.
-> Re-run `./setup-ci-deploy.sh` (after `02-deploy-odoo.sh` has completed on the
-> new boxes — it needs `ODOO_HOME`/etc. to already exist) to reinstall the
-> forced-command entry; the CI keypair itself (`secrets/ci-deploy-key`) doesn't
-> need regenerating, only its server-side installation, since a fresh instance
-> boots with an empty `authorized_keys`. Then update the `PRODUCTION_HOST`/
-> `STAGING_HOST` repo variables on the addon repo to the new IPs
-> (`gh variable set ...`) — the `CI_DEPLOY_SSH_KEY` secret itself doesn't
-> change. Re-running `setup-ci-deploy.sh` also refreshes the persisted
-> repo/branch/token config on each box, so do the same after changing
-> `ODOOSH_REPO_URL`, a branch name, or rotating `GITHUB_TOKEN`, even without a
-> re-provision.
+**After a re-provision (Elastic IPs or security group changed):**
+> The AWS environment was just re-provisioned. Re-run `./setup-ci-deploy.sh`
+> (after `02-deploy-odoo.sh` has completed on the new boxes) to reinstall the
+> forced-command entry, and `./setup-ci-aws-access.sh` if the security group
+> was recreated too — neither the SSH keypair nor the AWS role needs
+> regenerating, only their server-side/AWS-side installation. Then update the
+> addon repo's `PRODUCTION_HOST`/`STAGING_HOST` (and `SECURITY_GROUP_ID` if it
+> changed) repo variables — the secrets/role ARN don't change. Re-running
+> `setup-ci-deploy.sh` also refreshes the persisted repo/branch/token config on
+> each box, so do the same after changing `ODOOSH_REPO_URL`, a branch name, or
+> rotating `GITHUB_TOKEN`, even without a re-provision.
 
 **Diagnose a failed CI deploy:**
-> The GitHub Actions deploy failed for `<env>`. SSH in with the admin key (not
-> the CI key) and check `/tmp/update.log` and `/var/log/odoo/odoo.log` for the
-> actual error — likely the same categories as a migration reconcile failure
-> (infra/dependency, source data inconsistency, or a genuine module bug). Fix
-> at the right layer and confirm the app is healthy before re-triggering.
+> The GitHub Actions deploy failed for `<env>`. Pull the actual run log
+> (`gh run view <id> --repo <addon-repo> --log`) rather than trusting the
+> pass/fail label alone. Check for, in order: (a) an AWS/IAM error assuming the
+> OIDC role or touching the security group — read the exact denied action and
+> fix the IAM policy, don't just widen it blindly; (b) the SSH step itself
+> failing or disconnecting mid-run (e.g. "Broken pipe") — if so, SSH in with
+> the *admin* key (not the CI key) and check whether Odoo is actually still
+> running and the reconcile actually completed server-side before assuming
+> data is at risk; (c) the same categories as a migration reconcile failure
+> (infra/dependency, source data inconsistency, or a genuine module bug) once
+> the deploy script itself got far enough to run one. Confirm the app is
+> healthy and no SG rule was left behind before re-triggering, don't just
+> re-run and hope.
+
+**A note on git staleness when working across the addon repo:**
+> If a PR I open against the addon repo shows an unexpected merge conflict
+> right after a related PR merged, don't assume something changed upstream —
+> re-fetch that branch without `--depth 1` (a shallow fetch can be stale and
+> not yet reflect a just-merged commit) before rebuilding the PR from a
+> possibly-wrong base.
 
 ---
 

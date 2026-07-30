@@ -22,6 +22,12 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
   Safe to trigger on every code merge. `setup-ci-deploy.sh` wires this up to
   CI (see `ci-templates/deploy.yml` for the GitHub Actions side) via a
   restricted, forced-command-only SSH key — never the main admin key.
+  `setup-ci-aws-access.sh` sets up the other half CI needs: an AWS OIDC role
+  (no static AWS credential ever stored) scoped to only open/close a
+  temporary SSH rule on the project security group, since it's intentionally
+  locked to the operator's own IP and GitHub-hosted runners can't reach it
+  otherwise. Needs an AWS identity with IAM write access to run — a separate,
+  more privileged grant than day-to-day EC2 admin.
 - Every script is **idempotent** (AWS matched by Name tag; remote steps re-apply
   cleanly) and **fails loudly** (no silent success). Re-running a failed step is
   the normal recovery.
@@ -97,6 +103,36 @@ runbook) before acting. Ready-to-run task prompts live in `PROMPTS.md`.
   on each branch. After a re-provision, re-run `setup-ci-deploy.sh` (new boxes
   have empty `authorized_keys`) and update the addon repo's `PRODUCTION_HOST`/
   `STAGING_HOST` variables — the CI keypair itself doesn't need regenerating.
+- **IAM `Authorize`/`RevokeSecurityGroupIngress` needs a `security-group-rule`
+  resource grant, not just `security-group`** — the new/removed rule has no ID
+  yet, so AWS evaluates that half as a wildcard even though the request is
+  bound to one `--group-id`. A policy scoped to only the `security-group` ARN
+  fails with `UnauthorizedOperation` on the rule resource. Also: tagging that
+  rule needs a separate `ec2:CreateTags` grant on the same wildcard — not
+  worth it for a cosmetic label, so `ci-templates/deploy.yml` doesn't tag it.
+- **A long-silent SSH command over an unreliable path can get disconnected
+  mid-run** — the CI deploy redirects all its output to a remote log file, so
+  the SSH session is completely silent for the several minutes a full `-u all`
+  reconcile takes. An idle NAT/firewall between a GitHub-hosted runner and AWS
+  killed that connection once, right before the script's final
+  `systemctl start odoo`, leaving the box down until manually restarted (the
+  reconcile itself had already finished server-side by then). Fixed with
+  `ServerAliveInterval`/`ServerAliveCountMax` on the SSH command; any new
+  long-running silent remote command should get the same treatment.
+- **IAM write actions (`CreateRole`, `CreatePolicy`, `AttachRolePolicy`,
+  `CreateOpenIDConnectProvider`, `UpdateAssumeRolePolicy`) may be denied even
+  under an apparently-broad role like `SystemAdministrator`** — orgs commonly
+  wall these off separately since they define new trust relationships, not
+  just resources. `Get*`/read access on IAM can still work fine. If
+  `setup-ci-aws-access.sh` fails with `AccessDenied` on any of these, that's
+  the operator needing to grant temporary elevated access or run it
+  themselves — not a bug to route around.
+- **A shallow (`--depth 1`) git fetch of another repo's branch can be stale**
+  and not yet reflect a very recent merge, making a locally-built PR branch
+  look like it conflicts with content that's actually already there. If a PR
+  shows an unexpected conflict right after a related PR merged, re-fetch
+  without `--depth` (or re-fetch the specific ref explicitly) before assuming
+  something upstream changed unexpectedly.
 
 ## Verifying a healthy box
 
