@@ -15,7 +15,12 @@ export DEBIAN_FRONTEND=noninteractive
 source /etc/odoo-restore.env
 
 log(){ echo "[restore] $*"; }
-WORK="$(mktemp -d /tmp/odoo-migrate.XXXXXX)"
+# WORK must live on the large data volume (mounted at /var/lib/odoo by
+# bootstrap), not /tmp - /tmp is on the 30GB root volume (hardcoded in
+# 01-provision-aws.sh, independent of the configured EBS_GB data volume size)
+# and a large backup's extracted dump.sql + filestore routinely exceeds that,
+# failing with "write error (disk full?)" mid-extraction.
+WORK="$(mktemp -d /var/lib/odoo/odoo-migrate.XXXXXX)"
 trap 'rm -rf "${WORK}"' EXIT
 
 export PGPASSWORD="${PG_ODOO_DB_PASSWORD}"

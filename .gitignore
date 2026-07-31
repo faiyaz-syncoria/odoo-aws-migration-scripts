@@ -6,3 +6,4 @@ logs/
 *.pem
 *.key
 err.txt
+backup/
