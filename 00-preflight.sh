@@ -74,6 +74,14 @@ fi
 info "AWS"
 if aws sts get-caller-identity >/dev/null 2>&1; then
   pass "authenticated as $(aws sts get-caller-identity --query Arn --output text 2>/dev/null)"
+  live_acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)"
+  if placeholder "${AWS_ACCOUNT_ID:-}"; then
+    warn2 "AWS_ACCOUNT_ID not set in config.env - authenticated account is ${live_acct}; set it to guard future runs against the wrong account"
+  elif [[ "${live_acct}" == "${AWS_ACCOUNT_ID}" ]]; then
+    pass "authenticated account matches config.env AWS_ACCOUNT_ID (${AWS_ACCOUNT_ID})"
+  else
+    fail2 "authenticated account ${live_acct} does NOT match config.env AWS_ACCOUNT_ID (${AWS_ACCOUNT_ID}) - wrong profile/account"
+  fi
   if aws ec2 describe-availability-zones --region "${AWS_REGION}" >/dev/null 2>&1; then
     pass "region ${AWS_REGION} reachable"
   else fail2 "region ${AWS_REGION} not reachable / EC2 denied"; fi

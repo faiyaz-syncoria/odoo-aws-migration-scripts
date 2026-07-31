@@ -91,6 +91,21 @@ if [[ -z "$(cur AWS_AZ)" || "$(cur AWS_AZ)" == *CHANGE_ME* ]]; then setk AWS_AZ 
 ask AWS_AZ           "Availability zone"
 ask AWS_PROFILE      "AWS CLI profile (blank = default chain)"
 
+hdr "AWS account guard"
+say "Every AWS-touching script checks the authenticated caller against this before doing anything - protects against running with the wrong profile/account."
+profile_flag=(); [[ -n "$(cur AWS_PROFILE)" ]] && profile_flag=(--profile "$(cur AWS_PROFILE)")
+detected_acct=""
+if command -v aws >/dev/null 2>&1; then
+  detected_acct="$(aws "${profile_flag[@]}" sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [[ -n "${detected_acct}" ]]; then
+  read -r -p "Authenticated as account ${detected_acct} - use this? [Y/n]: " yn || true
+  if [[ "${yn:-Y}" =~ ^[Yy] ]]; then setk AWS_ACCOUNT_ID "${detected_acct}"; else ask AWS_ACCOUNT_ID "AWS account ID (12 digits)"; fi
+else
+  say "(not authenticated yet - enter the target account ID manually; 00-preflight.sh will verify it later)"
+  ask AWS_ACCOUNT_ID "AWS account ID (12 digits)"
+fi
+
 hdr "Admin SSH access"
 detected=""
 detected="$(curl -fsS --max-time 6 https://checkip.amazonaws.com 2>/dev/null | tr -d '[:space:]' || true)"

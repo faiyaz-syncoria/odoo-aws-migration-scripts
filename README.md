@@ -94,6 +94,12 @@ being authenticated in your shell. Two commands matter:
   # {"UserId": "...", "Account": "123456789012", "Arn": "arn:aws:sts::..."}
   ```
 
+  Set `AWS_ACCOUNT_ID` in `config.env` to that `Account` value (`configure.sh`
+  detects and offers it automatically). Every AWS-touching script then checks
+  the authenticated caller's account against it and refuses to proceed on a
+  mismatch — guards against a stale SSO session or wrong `AWS_PROFILE` pointing
+  at the wrong account.
+
 Why it matters here: **checkpoint 1** (provisioning) and the security-group
 helpers (`update-my-ip.sh`, `restrict-web-to-cloudflare.sh`) call the AWS API and
 will fail immediately if the session is missing or expired. Checkpoints 2–4 work

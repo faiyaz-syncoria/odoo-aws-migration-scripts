@@ -118,6 +118,12 @@ check_aws_auth() {
   need_cmd aws
   aws sts get-caller-identity >/dev/null 2>&1 \
     || die "AWS CLI is not authenticated for profile '${AWS_PROFILE:-default}'. Run 'aws configure'."
+  if [[ -n "${AWS_ACCOUNT_ID:-}" && "${AWS_ACCOUNT_ID}" != *CHANGE_ME* ]]; then
+    local live_acct
+    live_acct="$(aws sts get-caller-identity --query Account --output text 2>/dev/null)"
+    [[ "${live_acct}" == "${AWS_ACCOUNT_ID}" ]] \
+      || die "Authenticated AWS account (${live_acct}) does not match config.env AWS_ACCOUNT_ID (${AWS_ACCOUNT_ID}) - wrong profile/account, refusing to proceed."
+  fi
 }
 
 # ---- per-environment spec resolver -----------------------------------------
