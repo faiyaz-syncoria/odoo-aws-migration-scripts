@@ -313,6 +313,23 @@ fi
 # 9. Nightly backups (DB + filestore) with retention (+ optional S3)
 # -----------------------------------------------------------------------------
 log "Installing nightly backup job"
+if [[ -n "${BACKUP_S3_BUCKET}" ]] && ! command -v aws >/dev/null 2>&1; then
+  log "Installing AWS CLI v2 (needed for BACKUP_S3_BUCKET sync)"
+  command -v unzip >/dev/null 2>&1 || { apt-get -o DPkg::Lock::Timeout=300 update -qq && apt-get -o DPkg::Lock::Timeout=300 install -y -qq unzip; }
+  tmpdir="$(mktemp -d)"
+  curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "${tmpdir}/awscliv2.zip"
+  unzip -q -o "${tmpdir}/awscliv2.zip" -d "${tmpdir}"
+  "${tmpdir}/aws/install"
+  rm -rf "${tmpdir}"
+fi
+# DEST is on ODOO_HOME (/opt/odoo), which is the fixed 30GB root volume
+# (hardcoded in 01-provision-aws.sh) regardless of the configured EBS_GB data
+# volume size. On a box with little local headroom, set BACKUP_S3_BUCKET so
+# each night's dump+filestore is deleted right after a successful S3 sync
+# instead of accumulating locally for the full retention window - otherwise
+# local files still fill root within days and crash PostgreSQL with
+# "No space left on device" (same class of bug as the odoo-restore.sh /tmp
+# workdir issue), even with S3 configured.
 install -d -o "${ODOO_USER}" -g "${ODOO_USER}" "${ODOO_HOME}/backups"
 cat > /usr/local/bin/odoo-backup.sh <<EOF
 #!/usr/bin/env bash
@@ -320,16 +337,22 @@ set -Eeuo pipefail
 STAMP="\$(date +%Y%m%d-%H%M%S)"
 DEST="${ODOO_HOME}/backups"
 DB="${TARGET_DBNAME}"
-sudo -u postgres pg_dump -Fc "\${DB}" > "\${DEST}/\${DB}-\${STAMP}.dump"
+DUMP="\${DEST}/\${DB}-\${STAMP}.dump"
+FSTAR="\${DEST}/\${DB}-filestore-\${STAMP}.tar.gz"
+sudo -u postgres pg_dump -Fc "\${DB}" > "\${DUMP}"
 if [[ -d "${ODOO_FILESTORE}/\${DB}" ]]; then
-  tar czf "\${DEST}/\${DB}-filestore-\${STAMP}.tar.gz" -C "${ODOO_FILESTORE}" "\${DB}"
+  tar czf "\${FSTAR}" -C "${ODOO_FILESTORE}" "\${DB}"
 fi
-# retention
-find "\${DEST}" -type f -mtime +${BACKUP_RETENTION_DAYS} -delete
-# optional off-box copy
+# optional off-box copy; when configured, this backup's local copies are
+# deleted immediately after a successful sync (S3 is the retention layer, not
+# local disk) - only the day's dump+filestore are touched, never older files
 if [[ -n "${BACKUP_S3_BUCKET}" ]]; then
-  aws s3 sync "\${DEST}/" "s3://${BACKUP_S3_BUCKET}/${ODOO_ENV}/" --region "${AWS_REGION}" --only-show-errors || true
+  if aws s3 sync "\${DEST}/" "s3://${BACKUP_S3_BUCKET}/${ODOO_ENV}/" --region "${AWS_REGION}" --only-show-errors; then
+    rm -f "\${DUMP}" "\${FSTAR}"
+  fi
 fi
+# retention for whatever remains locally (S3-synced copies are already gone above)
+find "\${DEST}" -type f -mtime +${BACKUP_RETENTION_DAYS} -delete
 EOF
 chmod +x /usr/local/bin/odoo-backup.sh
 
