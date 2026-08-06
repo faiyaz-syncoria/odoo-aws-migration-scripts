@@ -22,6 +22,11 @@ TARGET_ENVS=("$@"); [[ ${#TARGET_ENVS[@]} -eq 0 ]] && TARGET_ENVS=("${ENVIRONMEN
 REMOTE_HARDEN="${REPO_ROOT}/remote/odoo-harden.sh"
 [[ -f "${REMOTE_HARDEN}" ]] || die "Missing ${REMOTE_HARDEN}"
 
+# Shared across environments (one bucket/role for both prod+staging, split by
+# the ${ODOO_ENV}/ prefix odoo-backup.sh already syncs to). No-op if
+# BACKUP_S3_BUCKET is unset.
+ensure_backup_s3_infra
+
 harden_one() {
   local e="$1" up
   up="$(echo "${e}" | tr '[:lower:]' '[:upper:]')"
@@ -29,6 +34,11 @@ harden_one() {
   state_load "${e}"
   [[ -n "${PUBLIC_IP:-}" ]] || die "No PUBLIC_IP for ${e}; run 01 first."
   require_no_placeholder "${up}_DOMAIN"
+
+  if [[ -n "${BACKUP_S3_BUCKET:-}" ]]; then
+    [[ -n "${INSTANCE_ID:-}" ]] || die "No INSTANCE_ID for ${e}; run 01 first."
+    ensure_backup_profile_attached "${INSTANCE_ID}"
+  fi
 
   # target DB var uses the PROD/STAGING abbreviation (domain vars use full word)
   local dbpfx="${up}"; [[ "${e}" == "production" ]] && dbpfx="PROD"

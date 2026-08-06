@@ -161,6 +161,86 @@ aws_instance_public_ip() { # instance-id
     | grep -v '^None$' || true
 }
 
+# ---- optional S3 backup infra (bucket + lifecycle + IAM role/profile) ------
+# No-op if BACKUP_S3_BUCKET is unset. Idempotent: bucket/role/policy/profile
+# are matched by name, so re-running just reconciles (e.g. picks up a changed
+# BACKUP_RETENTION_DAYS into the lifecycle rule). Called once per run (bucket
+# + role/policy/profile are shared across environments); each environment's
+# instance still needs the profile attached separately via
+# ensure_backup_profile_attached.
+ensure_backup_s3_infra() {
+  [[ -n "${BACKUP_S3_BUCKET:-}" ]] || return 0
+  check_aws_auth
+
+  if aws s3api head-bucket --bucket "${BACKUP_S3_BUCKET}" 2>/dev/null; then
+    info "S3 bucket ${BACKUP_S3_BUCKET} already exists"
+  else
+    info "Creating S3 bucket ${BACKUP_S3_BUCKET} for backups"
+    if [[ "${AWS_REGION}" == "us-east-1" ]]; then
+      aws s3api create-bucket --bucket "${BACKUP_S3_BUCKET}" --region "${AWS_REGION}"
+    else
+      aws s3api create-bucket --bucket "${BACKUP_S3_BUCKET}" --region "${AWS_REGION}" \
+        --create-bucket-configuration LocationConstraint="${AWS_REGION}"
+    fi
+    aws s3api put-public-access-block --bucket "${BACKUP_S3_BUCKET}" \
+      --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+    aws s3api put-bucket-encryption --bucket "${BACKUP_S3_BUCKET}" \
+      --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+  fi
+
+  info "Ensuring S3 lifecycle rule (expire after ${BACKUP_RETENTION_DAYS}d) on ${BACKUP_S3_BUCKET}"
+  aws s3api put-bucket-lifecycle-configuration --bucket "${BACKUP_S3_BUCKET}" \
+    --lifecycle-configuration "{\"Rules\":[{\"ID\":\"expire-backups\",\"Filter\":{},\"Status\":\"Enabled\",\"Expiration\":{\"Days\":${BACKUP_RETENTION_DAYS}}}]}"
+
+  local role policy profile trust perm
+  role="$(tag_name backup-role)"; profile="$(tag_name backup-profile)"; policy="$(tag_name backup-s3-policy)"
+  trust='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+  perm="{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\",\"s3:GetObject\",\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::${BACKUP_S3_BUCKET}\",\"arn:aws:s3:::${BACKUP_S3_BUCKET}/*\"]}]}"
+
+  if aws iam get-role --role-name "${role}" >/dev/null 2>&1; then
+    info "IAM role ${role} already exists"
+  else
+    info "Creating IAM role ${role} (S3 backup access, scoped to ${BACKUP_S3_BUCKET})"
+    aws iam create-role --role-name "${role}" --assume-role-policy-document "${trust}" \
+      --tags "Key=Name,Value=${role}" >/dev/null \
+      || die "Could not create IAM role ${role}. IAM write actions (CreateRole etc.) are sometimes walled off even under broad EC2 admin roles - grant temporary elevated IAM access, or create the role/policy/instance-profile yourself (see CLAUDE.md 'IAM write actions' gotcha), then re-run."
+  fi
+  aws iam put-role-policy --role-name "${role}" --policy-name "${policy}" --policy-document "${perm}" >/dev/null
+
+  if aws iam get-instance-profile --instance-profile-name "${profile}" >/dev/null 2>&1; then
+    info "IAM instance profile ${profile} already exists"
+  else
+    aws iam create-instance-profile --instance-profile-name "${profile}" >/dev/null
+    aws iam add-role-to-instance-profile --instance-profile-name "${profile}" --role-name "${role}"
+  fi
+}
+
+# Ensure an environment's EC2 instance has the shared backup instance profile
+# attached (idempotent - no-ops if already correct; replaces a different
+# association if one exists). No-op if BACKUP_S3_BUCKET is unset.
+ensure_backup_profile_attached() { # instance-id
+  [[ -n "${BACKUP_S3_BUCKET:-}" ]] || return 0
+  local instance_id="$1" profile
+  profile="$(tag_name backup-profile)"
+  local assoc_json assoc_id assoc_name
+  assoc_json="$(aws ec2 describe-iam-instance-profile-associations \
+    --filters "Name=instance-id,Values=${instance_id}" "Name=state,Values=associating,associated" \
+    --query 'IamInstanceProfileAssociations[0]' --output json 2>/dev/null)"
+  assoc_id="$(echo "${assoc_json}" | jq -r '.AssociationId // empty')"
+  assoc_name="$(echo "${assoc_json}" | jq -r '.IamInstanceProfile.Arn // empty' | sed 's#.*/##')"
+  if [[ "${assoc_name}" == "${profile}" ]]; then
+    info "Instance ${instance_id} already has instance profile ${profile}"
+  elif [[ -n "${assoc_id}" ]]; then
+    info "Replacing instance profile on ${instance_id} (${assoc_name:-none} -> ${profile})"
+    aws ec2 replace-iam-instance-profile-association --association-id "${assoc_id}" \
+      --iam-instance-profile "Name=${profile}" >/dev/null
+  else
+    info "Attaching instance profile ${profile} to ${instance_id}"
+    aws ec2 associate-iam-instance-profile --instance-id "${instance_id}" \
+      --iam-instance-profile "Name=${profile}" >/dev/null
+  fi
+}
+
 # ---- remote exec helpers ----------------------------------------------------
 # Run a local script on a remote box over SSH.
 ssh_key_path() { echo "${SECRETS_DIR}/${EC2_KEY_NAME}.pem"; }
