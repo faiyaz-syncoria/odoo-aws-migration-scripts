@@ -247,8 +247,13 @@ ssh_key_path() { echo "${SECRETS_DIR}/${EC2_KEY_NAME}.pem"; }
 
 remote_ssh() { # host  command...
   local host="$1"; shift
+  # ServerAlive*: long-running silent remote commands (e.g. the restore's
+  # multi-hour filestore tar/DB load) can otherwise get dropped by an idle
+  # NAT/firewall between here and AWS - see CLAUDE.md's 'long-silent SSH
+  # command' gotcha.
   ssh -i "$(ssh_key_path)" -o StrictHostKeyChecking=accept-new \
-      -o ConnectTimeout=15 "${SSH_USER}@${host}" "$@"
+      -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+      "${SSH_USER}@${host}" "$@"
 }
 remote_copy() { # src  host:dest
   local src="$1" dest="$2"
