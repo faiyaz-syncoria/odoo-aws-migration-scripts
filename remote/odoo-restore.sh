@@ -84,6 +84,10 @@ pull_local_file() {
   log "Using uploaded local backup zip (/tmp/odoo-backup.zip)"
   [[ -s /tmp/odoo-backup.zip ]] || { echo "expected /tmp/odoo-backup.zip - not found"; exit 1; }
   extract_backup_zip /tmp/odoo-backup.zip
+  # Free the 30GB root volume immediately - a multi-GB zip sitting in /tmp for
+  # the rest of the (long) restore competes with PGDATA, which also lives on
+  # root, and can fill it mid-restore (see CLAUDE.md's disk-full gotcha).
+  rm -f /tmp/odoo-backup.zip
 }
 
 case "${PULL_METHOD}" in

@@ -236,8 +236,25 @@ ensure_backup_profile_attached() { # instance-id
       --iam-instance-profile "Name=${profile}" >/dev/null
   else
     info "Attaching instance profile ${profile} to ${instance_id}"
-    aws ec2 associate-iam-instance-profile --instance-id "${instance_id}" \
-      --iam-instance-profile "Name=${profile}" >/dev/null
+    # A profile created moments ago by ensure_backup_s3_infra may not have
+    # propagated to the EC2 control plane yet - IAM is eventually consistent,
+    # and EC2 rejects an unpropagated name with "Invalid IAM Instance Profile
+    # name" (not a permissions error, just a race). Retry briefly.
+    local attempt
+    for attempt in 1 2 3 4 5; do
+      if aws ec2 associate-iam-instance-profile --instance-id "${instance_id}" \
+          --iam-instance-profile "Name=${profile}" >/dev/null 2>/tmp/assoc-err.$$; then
+        rm -f /tmp/assoc-err.$$
+        return 0
+      fi
+      if grep -q "Invalid IAM Instance Profile name" /tmp/assoc-err.$$ && [[ "${attempt}" -lt 5 ]]; then
+        warn "Instance profile ${profile} not yet visible to EC2 (IAM propagation delay) - retrying in 5s (${attempt}/5)"
+        sleep 5
+      else
+        cat /tmp/assoc-err.$$ >&2; rm -f /tmp/assoc-err.$$
+        die "Could not attach instance profile ${profile} to ${instance_id}"
+      fi
+    done
   fi
 }
 

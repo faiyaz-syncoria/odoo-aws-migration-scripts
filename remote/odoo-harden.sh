@@ -322,33 +322,74 @@ if [[ -n "${BACKUP_S3_BUCKET}" ]] && ! command -v aws >/dev/null 2>&1; then
   "${tmpdir}/aws/install"
   rm -rf "${tmpdir}"
 fi
-# DEST is on ODOO_HOME (/opt/odoo), which is the fixed 30GB root volume
-# (hardcoded in 01-provision-aws.sh) regardless of the configured EBS_GB data
-# volume size. On a box with little local headroom, set BACKUP_S3_BUCKET so
-# each night's dump+filestore is deleted right after a successful S3 sync
-# instead of accumulating locally for the full retention window - otherwise
-# local files still fill root within days and crash PostgreSQL with
-# "No space left on device" (same class of bug as the odoo-restore.sh /tmp
-# workdir issue), even with S3 configured.
-install -d -o "${ODOO_USER}" -g "${ODOO_USER}" "${ODOO_HOME}/backups"
+# DEST lives on the big EBS_GB data volume (mounted at /var/lib/odoo), NOT
+# ODOO_HOME (/opt/odoo) - that's the fixed 30GB root volume (hardcoded in
+# 01-provision-aws.sh) regardless of the configured EBS_GB size, and a
+# filestore backup routinely exceeds what's left of it once the base OS +
+# Postgres data are already on there (same class of bug as the
+# odoo-restore.sh /tmp workdir issue - see CLAUDE.md's disk-full gotcha; this
+# exact failure mode crashed a nightly backup mid-tar and filled root to 100%,
+# breaking Postgres, before this fix). S3 sync still deletes local copies
+# right after a successful upload, same as before - this only moves where
+# they sit in the meantime.
+install -d -o "${ODOO_USER}" -g "${ODOO_USER}" "${ODOO_FILESTORE%/filestore}/backups"
 cat > /usr/local/bin/odoo-backup.sh <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
-STAMP="\$(date +%Y%m%d-%H%M%S)"
-DEST="${ODOO_HOME}/backups"
+# STAMP may be pre-set by a caller (e.g. an on-demand wrapper) that wants to
+# know it in advance; the nightly timer never sets it, so it falls back here.
+STAMP="\${STAMP:-\$(date +%Y%m%d-%H%M%S)}"
+DEST="${ODOO_FILESTORE%/filestore}/backups"
 DB="${TARGET_DBNAME}"
 DUMP="\${DEST}/\${DB}-\${STAMP}.dump"
 FSTAR="\${DEST}/\${DB}-filestore-\${STAMP}.tar.gz"
+MANIFEST="\${DEST}/\${DB}-manifest-\${STAMP}.json"
+
+# Snapshot facts about what's about to be backed up BEFORE dumping, so a
+# restore elsewhere can later verify nothing went missing in transit. A fixed
+# set of tables that exist in every Odoo database (never a custom-module
+# table, which might not exist on every install).
+count_table() { # table-name
+  sudo -u postgres psql -d "\${DB}" -tAc \
+    "SELECT count(*) FROM \"\$1\"" 2>/dev/null | tr -d '[:space:]' || echo 0
+}
+FS_DIR="${ODOO_FILESTORE}/\${DB}"
+FS_BYTES=0; FS_FILES=0
+if [[ -d "\${FS_DIR}" ]]; then
+  FS_BYTES="\$(du -sb "\${FS_DIR}" 2>/dev/null | cut -f1 || echo 0)"
+  FS_FILES="\$(find "\${FS_DIR}" -type f 2>/dev/null | wc -l | tr -d '[:space:]')"
+fi
+
 sudo -u postgres pg_dump -Fc "\${DB}" > "\${DUMP}"
-if [[ -d "${ODOO_FILESTORE}/\${DB}" ]]; then
+if [[ -d "\${FS_DIR}" ]]; then
   tar czf "\${FSTAR}" -C "${ODOO_FILESTORE}" "\${DB}"
 fi
+
+cat > "\${MANIFEST}" <<MANIFEST_EOF
+{
+  "db": "\${DB}",
+  "env": "${ODOO_ENV}",
+  "stamp": "\${STAMP}",
+  "created_at": "\$(date -u +%FT%TZ)",
+  "dump_bytes": \$(stat -c%s "\${DUMP}" 2>/dev/null || echo 0),
+  "filestore_bytes": \${FS_BYTES:-0},
+  "filestore_file_count": \${FS_FILES:-0},
+  "table_counts": {
+    "res_partner": \$(count_table res_partner),
+    "res_users": \$(count_table res_users),
+    "ir_module_module": \$(count_table ir_module_module),
+    "ir_attachment": \$(count_table ir_attachment)
+  }
+}
+MANIFEST_EOF
+
 # optional off-box copy; when configured, this backup's local copies are
 # deleted immediately after a successful sync (S3 is the retention layer, not
-# local disk) - only the day's dump+filestore are touched, never older files
+# local disk) - only the day's dump+filestore+manifest are touched, never
+# older files
 if [[ -n "${BACKUP_S3_BUCKET}" ]]; then
   if aws s3 sync "\${DEST}/" "s3://${BACKUP_S3_BUCKET}/${ODOO_ENV}/" --region "${AWS_REGION}" --only-show-errors; then
-    rm -f "\${DUMP}" "\${FSTAR}"
+    rm -f "\${DUMP}" "\${FSTAR}" "\${MANIFEST}"
   fi
 fi
 # retention for whatever remains locally (S3-synced copies are already gone above)
