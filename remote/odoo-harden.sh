@@ -279,6 +279,33 @@ SSHD=/etc/ssh/sshd_config.d/99-hardening.conf
 if sshd -t 2>/dev/null; then systemctl reload ssh || systemctl reload sshd || true; log "SSH hardened"; fi
 
 # -----------------------------------------------------------------------------
+# 7b. Reliability: auto-restart on crash, swap as an OOM safety net
+# -----------------------------------------------------------------------------
+log "Configuring service auto-restart (postgresql, nginx)"
+for unit in "postgresql@${PG_VERSION}-main.service" nginx.service; do
+  mkdir -p "/etc/systemd/system/${unit}.d"
+  cat > "/etc/systemd/system/${unit}.d/override.conf" <<'EOF'
+[Service]
+Restart=on-failure
+RestartSec=5
+EOF
+done
+systemctl daemon-reload
+
+SWAPFILE="${ODOO_FILESTORE%/filestore}/swapfile"
+if [[ ! -f "${SWAPFILE}" ]]; then
+  SWAP_MB=$(( RAM_MB / 2 )); (( SWAP_MB > 4096 )) && SWAP_MB=4096
+  log "Configuring ${SWAP_MB}MB swap (OOM safety net, not sized for sustained paging)"
+  fallocate -l "${SWAP_MB}M" "${SWAPFILE}"
+  chmod 600 "${SWAPFILE}"
+  mkswap "${SWAPFILE}" >/dev/null
+  swapon "${SWAPFILE}"
+  grep -q "${SWAPFILE}" /etc/fstab || echo "${SWAPFILE} none swap sw 0 0" >> /etc/fstab
+  echo "vm.swappiness=10" > /etc/sysctl.d/99-swappiness.conf
+  sysctl --system >/dev/null 2>&1
+fi
+
+# -----------------------------------------------------------------------------
 # 8. CloudWatch agent (only where detailed monitoring is enabled = production)
 # -----------------------------------------------------------------------------
 if [[ "${MONITORING}" == "enabled" ]]; then
@@ -288,15 +315,29 @@ if [[ "${MONITORING}" == "enabled" ]]; then
   if wget -q "https://amazoncloudwatch-agent.s3.amazonaws.com/ubuntu/${ARCH}/latest/amazon-cloudwatch-agent.deb" -O "/tmp/${CW}"; then
     apt-get -o DPkg::Lock::Timeout=300 install -y -qq "/tmp/${CW}" >/dev/null || true
     mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-    cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+    cat > /opt/aws/amazon-cloudwatch-agent/etc/config.json <<EOF
 {
   "agent": {"metrics_collection_interval": 60},
   "metrics": {
     "namespace": "Odoo/Prod",
-    "append_dimensions": {"InstanceId": "${aws:InstanceId}"},
+    "append_dimensions": {"InstanceId": "\${aws:InstanceId}"},
     "metrics_collected": {
       "mem":  {"measurement": ["mem_used_percent"]},
       "disk": {"measurement": ["used_percent"], "resources": ["/","/var/lib/odoo"]}
+    }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/odoo/odoo.log",
+            "log_group_name": "/mermaid-pools/${ODOO_ENV}/odoo",
+            "log_stream_name": "{instance_id}",
+            "timestamp_format": "%Y-%m-%d %H:%M:%S,%f"
+          }
+        ]
+      }
     }
   }
 }
@@ -394,6 +435,18 @@ if [[ -n "${BACKUP_S3_BUCKET}" ]]; then
 fi
 # retention for whatever remains locally (S3-synced copies are already gone above)
 find "\${DEST}" -type f -mtime +${BACKUP_RETENTION_DAYS} -delete
+
+# report success to CloudWatch - reaching this line means every prior command
+# succeeded (set -Eeuo pipefail aborts the script on any earlier failure), so
+# this is a genuine "backup completed" signal. A missing-data alarm (no
+# datapoint in ~25h) catches both a failed run and a timer that never fired.
+TOKEN="\$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || true)"
+IID="\$(curl -s -H "X-aws-ec2-metadata-token: \${TOKEN}" http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || true)"
+if [[ -n "\${IID}" ]]; then
+  aws cloudwatch put-metric-data --region "${AWS_REGION}" --namespace "Odoo/Prod" \
+    --metric-name BackupSuccess --dimensions InstanceId="\${IID}" --value 1 --unit Count \
+    >/dev/null 2>&1 || true
+fi
 EOF
 chmod +x /usr/local/bin/odoo-backup.sh
 
