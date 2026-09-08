@@ -274,7 +274,14 @@ remote_ssh() { # host  command...
 }
 remote_copy() { # src  host:dest
   local src="$1" dest="$2"
-  scp -i "$(ssh_key_path)" -o StrictHostKeyChecking=accept-new -q "${src}" "${SSH_USER}@${dest}"
+  # rsync (not scp): a large upload (e.g. the ~20GB odoo.sh backup zip) over a
+  # flaky/NAT'd link can still die mid-transfer even with ServerAlive keepalive
+  # - the connection itself drops, not just an idle timeout. --partial keeps
+  # whatever arrived so a retry resumes instead of re-sending from byte 0;
+  # --append-verify checksums the already-transferred portion before resuming.
+  rsync -e "ssh -i $(ssh_key_path) -o StrictHostKeyChecking=accept-new \
+      -o ConnectTimeout=15 -o ServerAliveInterval=30 -o ServerAliveCountMax=10" \
+      -a --partial --append-verify -q "${src}" "${SSH_USER}@${dest}"
 }
 # Copy a script up and run it with sudo, streaming output back.
 remote_run_script() { # host  local_script  [args...]
