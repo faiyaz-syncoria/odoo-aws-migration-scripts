@@ -78,6 +78,11 @@ pull_https_backup() {
   log "Downloading odoo.sh backup zip"
   curl -fsSL "${ODOOSH_DUMP_URL}" -o "${WORK}/backup.zip"
   extract_backup_zip "${WORK}/backup.zip"
+  # Free the space immediately - it sits on the same data volume as the
+  # filestore being extracted/re-tarred right after this, and left in place
+  # it can push peak usage past a smaller volume's capacity mid-restore (see
+  # CLAUDE.md's disk-full gotcha; pull_local_file already does this for /tmp).
+  rm -f "${WORK}/backup.zip"
 }
 
 pull_local_file() {
