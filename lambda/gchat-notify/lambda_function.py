@@ -95,7 +95,17 @@ def _fetch_window_text(log_group, state_change_time, period_seconds):
             logGroupName=log_group,
             startTime=int(start.timestamp() * 1000),
             endTime=int(end.timestamp() * 1000),
-            limit=500,
+            # Exclude the high-volume access-log noise (werkzeug HTTP lines,
+            # longpolling websocket lines) rather than filtering *for*
+            # Traceback/CRITICAL/ERROR keywords - CloudWatch's multi-line
+            # grouping here splits every Python traceback into two events,
+            # and the second (the actual "SomeException: message" summary
+            # line KNOWN_CAUSES/GENERIC_EXCEPTION_RE need to match against)
+            # carries none of those keywords. Excluding noise instead of
+            # matching signal keeps every diagnostic line regardless of
+            # which words happen to be on it.
+            filterPattern='-"werkzeug" -"longpolling"',
+            limit=1000,
         )
     except Exception:
         return ""
