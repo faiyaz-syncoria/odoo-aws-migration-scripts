@@ -1,5 +1,7 @@
 # secrets and generated state - never commit
 config.env
+config.env.*
+!config.env.example
 secrets/
 .state/
 logs/
@@ -7,3 +9,7 @@ logs/
 *.key
 err.txt
 backup/
+
+# python bytecode (Odoo compiles custom addons in place)
+__pycache__/
+*.pyc
